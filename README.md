@@ -52,6 +52,20 @@ mcpv check          # does every reference in ./.env resolve?
 mcpv list           # environments and key names
 ```
 
+## Web UI
+
+```bash
+mcpv ui
+```
+
+This opens a local page in your browser. From it you can browse environments and key
+names, add or replace values, import a `.env`, delete secrets, and check that your
+project's `.env` references all resolve. It never shows a value, the same as the CLI.
+
+It only runs while you use it. It listens on 127.0.0.1 with a new token each time, and
+stops when you click Close, press Ctrl+C, or after 15 idle minutes. Nothing keeps
+running in the background.
+
 Also: `rm <address>` deletes a secret, `init` creates the vault, and `doctor` shows
 where the vault and its key are and whether it unlocks. `--json` works on `list`,
 `check` and `doctor`.
@@ -95,8 +109,13 @@ agent transcripts.
   `0600` key file. In CI, set `MCPV_KEY` (64 hex characters). On its own,
   `vault.json` is only ciphertext plus key names, whether it's in a backup, a synced
   folder, or a stray commit.
-- **No display surface.** No command prints a value. There is no `get` and no
-  `reveal`. Values only go into a child process's environment.
+- **No display surface.** No command prints a value, and no page of `mcpv ui` shows
+  one. There is no `get` and no `reveal`. Values only go into a child process's
+  environment.
+- **A locked-down local UI.** `mcpv ui` listens on 127.0.0.1 only, checks the Host
+  header (which blocks DNS rebinding), and requires a per-run token that is never
+  written to disk. It refuses cross-origin requests and non-JSON writes, sends a
+  strict Content-Security-Policy, and shuts itself down when idle.
 - **Output masking.** `run` masks resolved values in the child's stdout and stderr,
   even when a value is split across two writes. Use `--no-mask` for fully interactive
   programs.

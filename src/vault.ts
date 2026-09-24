@@ -132,6 +132,18 @@ export class Vault {
       .sort((a, b) => a.address.localeCompare(b.address));
   }
 
+  /** Like environments(), with each key's last-updated time. Names only; needs no key. */
+  inventory(): { address: string; keys: { name: string; updatedAt: string }[] }[] {
+    return Object.entries(this.file().environments)
+      .map(([path, entries]) => ({
+        address: `mcpm://${path}`,
+        keys: Object.entries(entries)
+          .map(([name, entry]) => ({ name, updatedAt: entry.updatedAt }))
+          .sort((a, b) => a.name.localeCompare(b.name)),
+      }))
+      .sort((a, b) => a.address.localeCompare(b.address));
+  }
+
   /** Key names in one environment, or null if it doesn't exist. Needs no key. */
   keys(address: string | EnvironmentAddress): string[] | null {
     const env = typeof address === "string" ? parseEnvironmentAddress(address) : address;

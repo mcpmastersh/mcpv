@@ -11,12 +11,14 @@
 //   - No command takes a value as an argument. argv lands in shell history,
 //     in `ps`, and in an agent's transcript; values come in over stdin.
 
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { AddressError, parseEnvironmentAddress, parseKeyAddress } from "./address.ts";
 import { DotEnvError, parseDotEnv, references, resolveDotEnv, rewriteAsReferences } from "./dotenv.ts";
 import { KeyError, availableOsStore, envKey, type KeyStore } from "./keys.ts";
 import { MIN_MASK_LENGTH } from "./mask.ts";
 import { CommandNotFoundError, runWithEnv } from "./run.ts";
+import { IDLE_MINUTES, startUi } from "./ui-server.ts";
 import { CliError, accent, action, bold, glyph, heading, muted, note, out, pad, row, say, setPlain } from "./term.ts";
 import { Vault, VaultError, readVaultFile, vaultHome } from "./vault.ts";
 import { VERSION } from "./version.ts";
@@ -28,7 +30,7 @@ import { VERSION } from "./version.ts";
 type Parsed = { positionals: string[]; rest: string[] | null; flags: Map<string, string[]> };
 
 /** Flags that take a value; everything else is boolean. */
-const VALUE_FLAGS = new Set(["env", "env-file", "into", "key-store", "only"]);
+const VALUE_FLAGS = new Set(["env", "env-file", "into", "key-store", "only", "port"]);
 
 function parseArgs(argv: string[]): Parsed {
   const positionals: string[] = [];
@@ -377,6 +379,51 @@ function cmdDoctor(p: Parsed): void {
   if (checks.some((c) => c.kind === "fail")) process.exitCode = 1;
 }
 
+function openBrowser(url: string): void {
+  const [cmd, args] =
+    process.platform === "darwin"
+      ? ["open", [url]]
+      : process.platform === "win32"
+        ? ["cmd", ["/c", "start", "", url]]
+        : ["xdg-open", [url]];
+  try {
+    spawn(cmd, args, { stdio: "ignore", detached: true }).on("error", () => {}).unref();
+  } catch {
+    // No browser here — the URL is printed anyway.
+  }
+}
+
+async function cmdUi(p: Parsed): Promise<void> {
+  const raw = flag(p, "port");
+  const port = raw === undefined ? 0 : Number(raw);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) usage("--port must be 1–65535", "mcpv ui --port 7438");
+  let ui;
+  try {
+    ui = await startUi({ port });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+      throw new CliError(`Port ${port} is already in use`, ["mcpv ui", `mcpv ui --port ${port + 1}`]);
+    }
+    throw error;
+  }
+  // The URL carries this run's token, so it goes to the terminal only. It
+  // grants set/replace/delete, never a read of a value.
+  say(heading("ui", `http://127.0.0.1:${ui.port}`));
+  say();
+  say(row("ok", "Running", "127.0.0.1 only, until you close it", 10));
+  say(row("info", "Open", ui.url, 10));
+  say();
+  say(note(`Stops on the page's Close button, Ctrl+C, or after ${IDLE_MINUTES} idle minutes.`));
+  if (!has(p, "no-open") && process.stdout.isTTY) openBrowser(ui.url);
+  const stop = () => ui.close();
+  process.once("SIGINT", stop);
+  process.once("SIGTERM", stop);
+  await ui.closed;
+  process.off("SIGINT", stop);
+  process.off("SIGTERM", stop);
+  say(row("ok", "Stopped"));
+}
+
 // ---------------------------------------------------------------------------
 // Help
 // ---------------------------------------------------------------------------
@@ -394,6 +441,7 @@ function help(): void {
   cmd("list [env-address]", "List environments and key names — never values");
   cmd("rm <key-address>", "Delete a secret");
   cmd("init [--key-store s]", "Create the vault (keychain, secret-service or file)");
+  cmd("ui [--port n] [--no-open]", "Open a local web UI: browse, add, replace, import. Never shows a value");
   cmd("doctor", "Where the vault and its key live, and whether it unlocks");
   say();
   say(`  ${bold("Addresses")}   ${muted("mcpm://<workspace>/<project>/<environment>[/<KEY>]")}`);
@@ -417,6 +465,7 @@ const COMMANDS: Record<string, (p: Parsed) => void | Promise<void>> = {
   run: cmdRun,
   rm: cmdRemove,
   doctor: cmdDoctor,
+  ui: cmdUi,
 };
 
 export async function main(argv: string[]): Promise<void> {
