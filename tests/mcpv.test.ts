@@ -6,7 +6,9 @@
 //      never hands the child the master key.
 //   2. Integrity: a ciphertext moved to another key's slot, a tampered one, or
 //      the wrong master key all fail loudly instead of decrypting to garbage.
-//   3. Stream discipline: `run` leaves stdout to the child; every status line
+//   3. mcpv ui: loopback-only, a per-run token, same-origin JSON writes, and
+//      no route that returns a value.
+//   4. Stream discipline: `run` leaves stdout to the child; every status line
 //      goes to stderr; `--json` output is one object on stdout.
 //
 // The CLI is driven from source as a subprocess — only a separate process can
@@ -15,6 +17,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { request } from "node:http";
 import { mkdtempSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +26,7 @@ import { parseAddress, parseKeyAddress } from "../src/address.ts";
 import { open, seal } from "../src/crypto.ts";
 import { parseDotEnv, rewriteAsReferences } from "../src/dotenv.ts";
 import { MASK, Masker } from "../src/mask.ts";
+import { startUi } from "../src/ui-server.ts";
 
 const bin = fileURLToPath(new URL("../src/bin.ts", import.meta.url));
 const SECRET = "sk_live_vault-test-9f8e7d6c5b4a";
@@ -208,4 +212,108 @@ test("integrity: moved ciphertexts and the wrong key fail loudly", async () => {
   const wrongKey = await cli(home, ["run", "--env", "mcpm://acme/api/dev", "--", "true"], { cwd, env: { MCPV_KEY: "00".repeat(32) } });
   assert.equal(wrongKey.code, 1);
   assert.match(wrongKey.stderr, /doesn't unlock this vault/);
+});
+
+// ---------------------------------------------------------------------------
+// mcpv ui — the local server
+// ---------------------------------------------------------------------------
+
+function http(
+  port: number,
+  method: string,
+  path: string,
+  opts: { token?: string; host?: string; headers?: Record<string, string>; body?: unknown; contentType?: string } = {},
+): Promise<{ status: number; headers: Record<string, unknown>; text: string }> {
+  return new Promise((resolve, reject) => {
+    const body = opts.body === undefined ? undefined : JSON.stringify(opts.body);
+    const req = request(
+      {
+        host: "127.0.0.1",
+        port,
+        method,
+        path,
+        headers: {
+          host: opts.host ?? `127.0.0.1:${port}`,
+          ...(opts.token ? { authorization: `Bearer ${opts.token}` } : {}),
+          ...(body !== undefined ? { "content-type": opts.contentType ?? "application/json" } : {}),
+          ...opts.headers,
+        },
+      },
+      (res) => {
+        let text = "";
+        res.on("data", (d) => (text += d));
+        res.on("end", () => resolve({ status: res.statusCode ?? 0, headers: res.headers, text }));
+      },
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
+test("ui: loopback Host, per-run token, same-origin JSON writes, strict headers", async () => {
+  const { home, cwd } = fresh();
+  const ui = await startUi({ home, cwd });
+  try {
+    const page = await http(ui.port, "GET", "/");
+    assert.equal(page.status, 200);
+    assert.match(String(page.headers["content-security-policy"]), /default-src 'none'.*frame-ancestors 'none'/);
+    assert.equal(page.headers["cache-control"], "no-store");
+    assert.match(ui.url, new RegExp(`^http://127\\.0\\.0\\.1:${ui.port}/#token=`), "the token rides in the fragment");
+
+    assert.equal((await http(ui.port, "GET", "/", { host: `evil.example:${ui.port}` })).status, 403, "DNS rebinding");
+    assert.equal((await http(ui.port, "GET", "/api/state")).status, 401, "no token");
+    assert.equal((await http(ui.port, "GET", "/api/state", { token: "x".repeat(43) })).status, 401, "wrong token");
+    assert.equal((await http(ui.port, "GET", "/api/state", { token: ui.token, headers: { origin: "https://evil.example" } })).status, 403);
+    assert.equal((await http(ui.port, "GET", "/api/state", { token: ui.token, headers: { "sec-fetch-site": "cross-site" } })).status, 403);
+    const form = await http(ui.port, "POST", "/api/secrets", { token: ui.token, body: { address: "mcpm://a/b/c/K", value: SECRET }, contentType: "text/plain" });
+    assert.equal(form.status, 415, "a cross-site form post can't be JSON");
+    assert.equal((await http(ui.port, "GET", "/api/state", { token: ui.token })).status, 200);
+  } finally {
+    ui.close();
+    await ui.closed;
+  }
+});
+
+test("ui: values go in write-only and never come back out", async () => {
+  const { home, cwd } = fresh();
+  writeFileSync(join(cwd, ".env"), "STRIPE_KEY=mcpm://acme/api/dev/STRIPE_KEY\nDB=mcpm://acme/api/dev/DB\n");
+  const ui = await startUi({ home, cwd });
+  const seen: string[] = [];
+  const call = async (method: string, path: string, body?: unknown) => {
+    const res = await http(ui.port, method, path, { token: ui.token, body });
+    seen.push(res.text);
+    return { status: res.status, json: JSON.parse(res.text) };
+  };
+  try {
+    const set = await call("POST", "/api/secrets", { address: "mcpm://acme/api/dev/STRIPE_KEY", value: SECRET });
+    assert.deepEqual(set, { status: 200, json: { ok: true, address: "mcpm://acme/api/dev/STRIPE_KEY", created: true } });
+
+    const imported = await call("POST", "/api/import", { environment: "mcpm://acme/api/dev", text: `DB="${DB}"\nPORT=3000\n`, only: ["DB"] });
+    assert.deepEqual(imported.json.keys, ["DB"]);
+
+    const state = await call("GET", "/api/state");
+    assert.deepEqual(state.json.environments.map((e: { address: string; keys: { name: string }[] }) => [e.address, e.keys.map((k) => k.name)]), [["mcpm://acme/api/dev", ["DB", "STRIPE_KEY"]]]);
+    const check = await call("GET", "/api/check");
+    assert.deepEqual(check.json.references.map((r: { key: string; found: boolean }) => [r.key, r.found]), [["STRIPE_KEY", true], ["DB", true]]);
+
+    const bad = await call("POST", "/api/secrets", { address: "mcpm://acme/api/dev", value: SECRET });
+    assert.equal(bad.status, 400);
+    assert.match(bad.json.error, /whole environment/);
+
+    const removed = await call("POST", "/api/secrets/delete", { address: "mcpm://acme/api/dev/DB" });
+    assert.equal(removed.status, 200);
+    assert.equal((await call("POST", "/api/secrets/delete", { address: "mcpm://acme/api/dev/DB" })).status, 404);
+
+    for (const text of seen) assert.ok(!text.includes(SECRET) && !text.includes(DB), `a response leaked a value: ${text}`);
+    assert.ok(!readFileSync(join(home, "vault.json"), "utf8").includes(SECRET));
+
+    // What the UI stored is what `run` injects.
+    const run = await cli(home, ["run", "--env", "mcpm://acme/api/dev", "--", process.execPath, "-e", "process.exit(process.env.STRIPE_KEY === " + JSON.stringify(SECRET) + " ? 0 : 9)"], { cwd });
+    assert.equal(run.code, 0, run.stderr);
+
+    await call("POST", "/api/shutdown", {});
+    await ui.closed;
+  } finally {
+    ui.close();
+  }
 });
