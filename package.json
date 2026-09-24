@@ -1,5 +1,5 @@
 {
-  "name": "mcpv",
+  "name": "@mcpmastersh/mcpv",
   "version": "0.1.0",
   "description": "Offline, encrypted secrets for AI agents. Commit .env files full of mcpm:// references; `mcpv run` resolves them in memory, injects them into one process and masks its output — the agent never sees a value.",
   "license": "Apache-2.0",

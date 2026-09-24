@@ -27,7 +27,8 @@ No server, no account, no network. One encrypted file on your machine.
 ## Install
 
 ```bash
-npm i -g mcpv        # or: npx mcpv …
+npm i -g @mcpmastersh/mcpv     # installs the `mcpv` command
+npx @mcpmastersh/mcpv doctor   # or run it without installing
 ```
 
 Needs Node 20 or newer. No runtime dependencies.
@@ -123,7 +124,7 @@ that has no access to the vault. This tool can't enforce that for you.
 ## As a library
 
 ```ts
-import { Vault, parseDotEnv, resolveDotEnv } from "mcpv";
+import { Vault, parseDotEnv, resolveDotEnv } from "@mcpmastersh/mcpv";
 
 const vault = Vault.open();
 const token = vault.resolveKey("mcpm://acme/api/dev/GITHUB_TOKEN"); // in memory, for your code to use
