@@ -13,7 +13,8 @@
 // 'single-quoted' literals and "double-quoted" values with \n, \t, \" and \\.
 // Multi-line quoted values are rejected rather than half-parsed.
 
-import { isAddress, parseKeyAddress } from "./address.ts";
+import { formatAddress } from "./address.ts";
+import { parseKeyDraft } from "./address-input.ts";
 import type { Vault } from "./vault.ts";
 
 export type DotEnvEntry = { key: string; value: string; line: number };
@@ -59,17 +60,39 @@ export function parseDotEnv(text: string): DotEnvEntry[] {
   return entries;
 }
 
-/** The `mcpm://` references in a .env, validated. Never touches a value. */
+/**
+ * Whether a .env *value* is meant to be an address rather than a literal.
+ *
+ * Deliberately scheme-based. A bare `acme/api/dev/KEY` is indistinguishable
+ * from a relative path or any other slashed string — `LOG_PATH=var/log/app/err`
+ * must stay a path — so a value only becomes a reference when it says it is
+ * one. Every spelling of the scheme counts (`mcpm:/`, `MCPM://`), so a typo'd
+ * address is reported by the parser instead of being injected as a literal
+ * value, which is the failure mode nothing would ever notice.
+ *
+ * This is the one predicate for that question: `references()`, `import`'s
+ * skip-references rule and the UI's import preview all ask it.
+ */
+export function isReferenceValue(value: string): boolean {
+  return /^mcpm:/i.test(value.trim());
+}
+
+/** The `mcpm://` references in a .env, repaired and validated. Never touches a value. */
 export function references(entries: DotEnvEntry[]): { key: string; address: string; line: number }[] {
   return entries
-    .filter((entry) => isAddress(entry.value))
+    .filter((entry) => isReferenceValue(entry.value))
     .map((entry) => {
+      let address: string;
       try {
-        parseKeyAddress(entry.value);
+        // Through the same reader every typed address goes through, so what a
+        // .env holds is stored and compared in one canonical form: a reference
+        // written as `mcpm://Acme/API/Dev/KEY` resolves against the same vault
+        // entry that `mcpm://acme/api/dev/KEY` does, instead of looking missing.
+        address = formatAddress(parseKeyDraft(entry.value));
       } catch (error) {
         throw new DotEnvError(`Line ${entry.line} (${entry.key}): ${(error as Error).message}`);
       }
-      return { key: entry.key, address: entry.value, line: entry.line };
+      return { key: entry.key, address, line: entry.line };
     });
 }
 
