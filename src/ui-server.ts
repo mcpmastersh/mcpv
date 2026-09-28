@@ -23,8 +23,24 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { AddressError, formatAddress, parseEnvironmentAddress, parseKeyAddress } from "./address.ts";
-import { DotEnvError, parseDotEnv, references } from "./dotenv.ts";
+import { AddressError, formatAddress, type Address, type EnvironmentAddress } from "./address.ts";
+import {
+  addressDraft,
+  addressPreview,
+  completeDraft,
+  draftProblem,
+  filterRows,
+  inventoryRows,
+  missingNote,
+  paginate,
+  parseDraftFields,
+  readAddressInput,
+  suggestionsFor,
+  type Draft,
+  type Part,
+  type SecretFilter,
+} from "./address-input.ts";
+import { DotEnvError, isReferenceValue, parseDotEnv, references } from "./dotenv.ts";
 import { KeyError } from "./keys.ts";
 import { Vault, VaultError, readVaultFile, vaultHome } from "./vault.ts";
 import { webAsset } from "./web-assets.ts";
@@ -33,6 +49,8 @@ import { VERSION } from "./version.ts";
 export const IDLE_MINUTES = 15;
 const MAX_BODY_BYTES = 1024 * 1024;
 const MAX_VALUE_BYTES = 64 * 1024;
+const MAX_PAGE_SIZE = 200;
+const DEFAULT_PAGE_SIZE = 25;
 
 const SECURITY_HEADERS: Record<string, string> = {
   "Content-Security-Policy":
@@ -129,6 +147,122 @@ function projectCheck(home: string, cwd: string) {
   }
 }
 
+function inventory(home: string): { address: string; keys: { name: string; updatedAt: string }[] }[] {
+  return readVaultFile(home) ? Vault.open(home).inventory() : [];
+}
+
+/**
+ * The address pieces a request carries, however the client sent them: one box
+ * per piece (`fields`), a whole pasted address (`address` / `environment`), or
+ * both at once — which is what the form produces when someone pastes an
+ * address into a single box. Everything goes through the same reader the CLI
+ * uses, so neither surface can accept a spelling the other rejects.
+ */
+function draftFrom(body: Record<string, unknown>): Draft {
+  const fields: Draft = {};
+  const boxes = body.fields;
+  if (boxes && typeof boxes === "object" && !Array.isArray(boxes)) {
+    const record = boxes as Record<string, unknown>;
+    for (const part of ["workspace", "project", "environment", "key"] as Part[]) {
+      const value = record[part];
+      if (typeof value === "string") fields[part] = value;
+    }
+  }
+  for (const name of ["address", "environment"]) {
+    const value = body[name];
+    if (typeof value !== "string" || value.trim() === "") continue;
+    const read = readAddressInput(value, { needKey: true });
+    for (const part of ["workspace", "project", "environment", "key"] as Part[]) {
+      if (fields[part] === undefined && read.parts[part] !== undefined) fields[part] = read.parts[part];
+    }
+  }
+  return fields;
+}
+
+/**
+ * What a form should show for the address it is halfway through: which pieces
+ * are filled, which are missing, what was repaired, and what could go in each
+ * empty box. The client renders this and does no address reasoning of its own.
+ */
+function addressPreviewOf(home: string, body: Record<string, unknown>) {
+  const needKey = body.needKey === true;
+  const read = completeDraft(draftFrom(body), { needKey });
+  const problem = draftProblem(read);
+  const complete = problem === null && read.missing.length === 0;
+  return {
+    parts: read.parts,
+    missing: read.missing,
+    repaired: read.repaired,
+    unreadable: read.unreadable,
+    problem,
+    note: read.empty ? null : missingNote(read.missing, read.parts, needKey),
+    address: complete ? addressDraft(read.parts, needKey) : addressPreview(read.parts, needKey),
+    valid: complete,
+    suggestions: suggestionsFor(inventory(home), read.parts),
+  };
+}
+
+/**
+ * What importing a pasted .env would do, before anything is stored. The request
+ * carries the .env's contents (the same payload Import itself sends, and this
+ * route discards it); the answer names keys and counts and never echoes a
+ * value, so a preview can't become a read path.
+ *
+ * `source: "project"` reads `./.env` beside the folder `mcpv ui` was started
+ * in — the path is fixed here and never taken from the request, so this can't
+ * become a "read any file" route, and for that source no value crosses the
+ * socket at all.
+ */
+function importPreviewOf(body: Record<string, unknown>, cwd: string) {
+  const nothing = {
+    environment: null as string | null,
+    file: null as string | null,
+    plain: [] as string[],
+    references: [] as string[],
+    skipped: [] as string[],
+  };
+  if (body.source !== undefined && body.source !== "project" && body.source !== "text") {
+    throw new HttpError(400, 'source must be "project" or "text"');
+  }
+  const project = body.source === "project";
+  const projectPath = join(cwd, ".env");
+  if (project && !existsSync(projectPath)) {
+    return { ...nothing, error: `There's no .env in ${cwd} — choose a file, or paste its contents` };
+  }
+  const text = project ? readFileSync(projectPath, "utf8") : typeof body.text === "string" ? body.text : "";
+  if (text.trim() === "") return { ...nothing, file: project ? projectPath : null };
+  let entries;
+  try {
+    entries = parseDotEnv(text);
+  } catch (error) {
+    if (error instanceof DotEnvError) return { ...nothing, error: error.message };
+    throw error;
+  }
+  // The same rule POST /api/import applies, so the summary a person reads
+  // before pressing Import is the one that actually runs.
+  const plain = entries.filter((entry) => entry.value !== "" && !isReferenceValue(entry.value));
+  const refs = entries.filter((entry) => isReferenceValue(entry.value));
+  const detected = refs.map((entry) => readAddressInput(entry.value).parts).find((piece) => piece.workspace && piece.project && piece.environment);
+  return {
+    environment: detected ? `mcpm://${detected.workspace}/${detected.project}/${detected.environment}` : null,
+    file: project ? projectPath : null,
+    plain: plain.map((entry) => entry.key),
+    references: refs.map((entry) => entry.key),
+    skipped: entries.filter((entry) => entry.value === "").map((entry) => entry.key),
+  };
+}
+
+/** The .env text an import should read, from the source the request named. */
+function importText(body: Record<string, unknown>, cwd: string): string {
+  if (body.source === "project") {
+    const path = join(cwd, ".env");
+    if (!existsSync(path)) throw new HttpError(404, `There's no .env in ${cwd}`);
+    return readFileSync(path, "utf8");
+  }
+  if (body.source !== undefined && body.source !== "text") throw new HttpError(400, "source must be \"project\" or \"text\"");
+  return text(body, "text");
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -200,9 +334,40 @@ export function startUi(options: { port?: number; home?: string; cwd?: string } 
       case "GET /api/check":
         return sendJson(res, 200, projectCheck(home, cwd));
 
+      // The list the page renders: one page of secrets, filtered and matched by
+      // the same code `mcpv list` uses, so "search" can't mean two things.
+      case "GET /api/secrets": {
+        const param = (name: string) => {
+          const value = url.searchParams.get(name);
+          return value === null || value === "" ? undefined : value;
+        };
+        const filter: SecretFilter = { search: param("search"), workspace: param("workspace"), project: param("project"), environment: param("environment") };
+        const page = Math.max(1, Number(param("page") ?? 1) || 1);
+        const size = Math.min(MAX_PAGE_SIZE, Math.max(1, Number(param("limit") ?? DEFAULT_PAGE_SIZE) || DEFAULT_PAGE_SIZE));
+        const matched = filterRows(inventoryRows(inventory(home)), filter);
+        return sendJson(res, 200, {
+          ...paginate(matched, page, size),
+          filters: filter,
+          // Every environment a match came from, so the page can offer them as
+          // one-click scopes without a second request.
+          environments: [...new Set(matched.map((row) => `mcpm://${row.path}`))],
+        });
+      }
+
+      // What the address form shows while it's being filled in. Read-only: the
+      // client sends the boxes, the shared reader answers.
+      case "POST /api/address/preview":
+        return sendJson(res, 200, addressPreviewOf(home, await readJson(req)));
+
+      // What importing a pasted .env would do, before anything is stored.
+      case "POST /api/import/preview":
+        return sendJson(res, 200, importPreviewOf(await readJson(req), cwd));
+
       case "POST /api/secrets": {
         const body = await readJson(req);
-        const address = formatAddress(parseKeyAddress(text(body, "address")));
+        // Both shapes are accepted: named boxes from the form, or one address
+        // string (`acme/api/dev/KEY` included) from anything else.
+        const address = formatAddress(parseDraftFields(draftFrom(body), { needKey: true }) as Required<Address>);
         const value = body.value;
         if (typeof value !== "string" || value === "") throw new HttpError(400, "Enter a value");
         if (Buffer.byteLength(value) > MAX_VALUE_BYTES) throw new HttpError(413, "That value is over 64 KB");
@@ -212,17 +377,17 @@ export function startUi(options: { port?: number; home?: string; cwd?: string } 
 
       case "POST /api/secrets/delete": {
         const body = await readJson(req);
-        const address = formatAddress(parseKeyAddress(text(body, "address")));
+        const address = formatAddress(parseDraftFields(draftFrom(body), { needKey: true }) as Required<Address>);
         if (!readVaultFile(home) || !Vault.open(home).remove(address)) throw new HttpError(404, `Nothing is stored at ${address}`);
         return sendJson(res, 200, { ok: true, address });
       }
 
       case "POST /api/import": {
         const body = await readJson(req);
-        const environment = formatAddress(parseEnvironmentAddress(text(body, "environment")));
+        const environment = formatAddress(parseDraftFields(draftFrom(body)) as EnvironmentAddress);
         const only = Array.isArray(body.only) ? new Set(body.only.filter((k): k is string => typeof k === "string")) : null;
-        const entries = parseDotEnv(text(body, "text")).filter(
-          (entry) => entry.value !== "" && !entry.value.startsWith("mcpm://") && (!only || only.has(entry.key)),
+        const entries = parseDotEnv(importText(body, cwd)).filter(
+          (entry) => entry.value !== "" && !isReferenceValue(entry.value) && (!only || only.has(entry.key)),
         );
         if (entries.length === 0) throw new HttpError(400, "No plain values to import — references and empty values are skipped");
         const result = Vault.init(home).vault.setMany(environment, Object.fromEntries(entries.map((e) => [e.key, e.value])));

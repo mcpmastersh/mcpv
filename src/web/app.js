@@ -6,6 +6,12 @@
 // down with it. Framework-free and dependency-free so it can ship inlined in
 // the single-file CLI; the DOM is built with textContent via h(), never
 // innerHTML, since key names and .env contents are user data.
+//
+// Address handling is deliberately *not* implemented here. `mcpm://` has one
+// grammar and one repair (src/address-input.ts), shared with the CLI, so this
+// page asks the server what a half-typed address means (`/api/address/preview`)
+// and renders the answer. A second copy of the rules in this file is exactly
+// how the two surfaces would end up disagreeing about where a secret lives.
 
 "use strict";
 
@@ -89,6 +95,11 @@ const ICONS = {
   copy: "M9 9h11v11H9zM5 15H4V4h11v1",
   edit: "M4 20h4L19 9l-4-4L4 16v4zM13 7l4 4",
   power: "M12 3v9M6.4 6.4a8 8 0 1 0 11.2 0",
+  search: "M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16zM21 21l-4.3-4.3",
+  file: "M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5zM14 3v5h5",
+  left: "M15 18l-6-6 6-6",
+  right: "M9 6l6 6-6 6",
+  check: "M4 12.5l5 5L20 7",
 };
 
 function icon(name) {
@@ -117,6 +128,7 @@ async function copy(text, label) {
 }
 
 function ago(iso) {
+  if (!iso) return "";
   const seconds = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
   if (!Number.isFinite(seconds)) return "";
   if (seconds < 60) return "just now";
@@ -131,6 +143,15 @@ function ago(iso) {
 }
 
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+const bytes = (n) => (n < 1024 ? `${n} B` : `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`);
+
+function debounce(fn, ms) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), ms);
+  };
+}
 
 // The one modal: focus trapped, Escape closes, the page behind is inert.
 // No window.confirm/alert anywhere.
@@ -150,7 +171,7 @@ function openDialog(build, onClose) {
   const onKey = (e) => {
     if (e.key === "Escape") close();
     if (e.key === "Tab") {
-      const items = [...dialog.querySelectorAll("button, input, textarea")].filter((n) => !n.disabled);
+      const items = [...dialog.querySelectorAll("button, input, textarea, select")].filter((n) => !n.disabled);
       if (items.length === 0) return;
       const first = items[0], last = items[items.length - 1];
       if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
@@ -162,7 +183,13 @@ function openDialog(build, onClose) {
   append(dialog, [build(close)]);
   document.body.append(overlay);
   app.inert = true;
-  const focusTarget = dialog.querySelector("[autofocus]") || dialog.querySelector("input, textarea, button");
+  // Focus the first thing a person can actually see: the file input behind
+  // "Choose file…" is in the DOM but never visible, and on a project-import
+  // dialog most of the form starts hidden.
+  const visible = [...dialog.querySelectorAll("input, textarea, select, button")].filter(
+    (node) => !node.disabled && !node.closest("[hidden]"),
+  );
+  const focusTarget = dialog.querySelector("[autofocus]") || visible[0];
   if (focusTarget) focusTarget.focus();
   return close;
 }
@@ -180,69 +207,263 @@ function confirmDialog({ title, description, confirmLabel }) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Validation mirrors the CLI's address grammar, for inline messages only —
-// the server is still the authority.
-// ---------------------------------------------------------------------------
-
-const ENV_RE = /^mcpm:\/\/[a-z0-9][a-z0-9_-]*\/[a-z0-9][a-z0-9_-]*\/[a-z0-9][a-z0-9_-]*\/?$/;
-const KEY_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-
-function checkEnvironment(value) {
-  if (!value) return "Enter an environment address";
-  if (!ENV_RE.test(value)) return "Use mcpm://<workspace>/<project>/<environment> — lowercase letters, digits, - or _";
-  return null;
-}
-
 function field(label, input, hint) {
   const error = h("div", { class: "field-error", role: "alert", hidden: true });
   const wrap = h("div", { class: "field" }, h("label", { for: input.id }, label), input, hint && h("div", { class: "hint" }, hint), error);
-  return { wrap, setError(message) { error.textContent = message || ""; error.hidden = !message; } };
+  return { wrap, input, setError(message) { error.textContent = message || ""; error.hidden = !message; } };
 }
 
-let data = { state: null, check: null };
+let data = { state: null, check: null, page: null };
 
-function environmentList() {
-  const list = h("datalist", { id: "env-list" });
-  for (const env of data.state?.environments ?? []) list.append(h("option", { value: env.address }));
-  return list;
+// ---------------------------------------------------------------------------
+// The address builder
+//
+// Three boxes (plus a key box when a key is wanted), a live readout of the
+// address they add up to, and one-click picks of what's already in the vault.
+// Every question about the address — is it complete, what was repaired, what
+// could go in this box — is answered by POST /api/address/preview, so this
+// component never parses an address itself.
+// ---------------------------------------------------------------------------
+
+const PART_LABEL = { workspace: "Workspace", project: "Project", environment: "Environment", key: "Key" };
+const PART_HINT = { workspace: "acme", project: "api", environment: "dev", key: "STRIPE_KEY" };
+
+let builderCount = 0;
+
+function addressBuilder({ initial = {}, needKey = false, readonly = false, autofocusFirst = true } = {}) {
+  const id = `b${++builderCount}`;
+  const parts = needKey ? ["workspace", "project", "environment", "key"] : ["workspace", "project", "environment"];
+  const fields = {};
+  for (const part of parts) fields[part] = initial[part] ?? "";
+
+  const inputs = {};
+  const lists = {};
+  const chips = h("div", { class: "chips" });
+  const readout = h("div", { class: "addr-readout" });
+  const note = h("div", { class: "addr-note", hidden: true });
+  const error = h("div", { class: "field-error", role: "alert", hidden: true });
+  let preview = null;
+  let seq = 0;
+  let touched = false;
+
+  // A div, not a form: this sits inside the dialog's own form, and a nested
+  // form is not a thing HTML has. As a plain div its inputs still belong to
+  // the dialog's form, so Enter in any of them submits the dialog — which is
+  // what someone typing a key name and hitting Enter expects. A nested form
+  // would have swallowed that keystroke and done nothing at all.
+  const element = h("div", { class: "addr-builder" });
+
+  function setNote(message) {
+    note.textContent = message || "";
+    note.hidden = !message;
+  }
+
+  function setError(message) {
+    error.textContent = message || "";
+    error.hidden = !message;
+  }
+
+  function value() {
+    return { ...fields };
+  }
+
+  function sync() {
+    for (const part of parts) if (inputs[part].value !== fields[part]) inputs[part].value = fields[part];
+  }
+
+  function paint() {
+    const complete = preview ? preview.valid : false;
+    readout.replaceChildren(
+      h("span", { class: `addr-preview mono ${complete ? "ok" : ""}` }, preview ? preview.address : ""),
+      complete ? h("span", { class: "badge ok" }, icon("check"), "Ready") : null,
+    );
+    if (preview) setError(preview.problem);
+    if (!preview || preview.valid) setNote(null);
+    else if (preview.note) setNote(preview.note);
+
+    // Datalists: what exists in the vault for this box, given the boxes to its
+    // left. They turn each field into a pick-list instead of a guess.
+    const suggestions = (preview && preview.suggestions) || {};
+    const options = {
+      workspace: suggestions.workspaces,
+      project: suggestions.projects,
+      environment: suggestions.environmentNames,
+      key: suggestions.keys,
+    };
+    for (const part of parts) {
+      const list = lists[part];
+      list.replaceChildren(...(options[part] || []).map((name) => h("option", { value: name })));
+    }
+
+    // Picks, in the order the decision is made: whole environments that exist
+    // (choosing one finishes all three boxes at once), then — once the address
+    // is settled — the key names already stored there, so a new reference
+    // reuses the exact spelling the vault already has.
+    const environments = complete ? [] : suggestions.environments || [];
+    const keyNames = needKey && complete ? suggestions.keys || [] : [];
+    const rows = [];
+    if (!readonly && environments.length > 0) {
+      rows.push(h("div", { class: "chip-row" },
+        h("span", { class: "chip-label" }, "Use an existing one"),
+        chipsOf(environments, (address) => {
+          Object.assign(fields, draftFrom(address), { key: fields.key });
+          sync();
+          touched = true;
+          void refresh();
+        })));
+    }
+    if (!readonly && keyNames.length > 0) {
+      rows.push(h("div", { class: "chip-row" },
+        h("span", { class: "chip-label" }, "Key names already here"),
+        chipsOf(keyNames, (name) => { fields.key = name; sync(); touched = true; void refresh(); })));
+    }
+    chips.replaceChildren(...rows);
+  }
+
+  function chipsOf(values, pick) {
+    return h("div", { class: "chip-set" }, values.map((text) =>
+      h("button", { type: "button", class: "chip mono", onclick: () => pick(text), title: text }, text)));
+  }
+
+  // Ask the server what the boxes currently mean.
+  async function refresh(why) {
+    const mine = ++seq;
+    let result;
+    try {
+      result = await api("POST", "/api/address/preview", { fields: value(), needKey });
+    } catch (err) {
+      if (err.message) setError(err.message);
+      return null;
+    }
+    if (mine !== seq || !element.isConnected) return null;
+    preview = result;
+    paint();
+    if (why === "blur") {
+      // Repair what was typed — "Acme API" becomes acme-api — but only once the
+      // box is left, so nothing shifts under the cursor mid-word.
+      const repairs = [];
+      for (const part of parts) {
+        const wanted = result.parts[part];
+        if (wanted === undefined || wanted === fields[part]) continue;
+        repairs.push(`“${fields[part]}” → ${wanted}`);
+        fields[part] = wanted;
+      }
+      if (repairs.length > 0) {
+        sync();
+        setNote(`${repairs.join(" · ")} — lowercase letters, digits and dashes`);
+      }
+    }
+    if (why === "paste") {
+      // A whole address pasted into one box belongs in all of them: the box it
+      // landed in takes its own piece, the boxes before it keep what they had.
+      const next = {};
+      for (const part of parts) next[part] = result.parts[part] ?? fields[part];
+      Object.assign(fields, next);
+      sync();
+      void refresh();
+    }
+    return result;
+  }
+
+  const scheduleRefresh = debounce(() => void refresh(), 120);
+
+  for (const part of parts) {
+    const list = h("datalist", { id: `${id}-${part}` });
+    lists[part] = list;
+    const input = h("input", {
+      id: `${id}-${part}`,
+      class: "mono",
+      value: fields[part],
+      placeholder: PART_HINT[part],
+      list: list.id,
+      autocomplete: "off",
+      spellcheck: "false",
+      readonly: readonly || undefined,
+      autofocus: autofocusFirst && part === parts[0] && !readonly ? true : undefined,
+      "aria-label": PART_LABEL[part],
+    });
+    inputs[part] = input;
+    if (!readonly) {
+      input.addEventListener("input", () => {
+        fields[part] = input.value;
+        touched = true;
+        setError(null);
+        // Slashes mean a whole address landed in one box — split it straight
+        // away rather than making the person cut it up themselves.
+        if (input.value.includes("/")) void refresh("paste");
+        else scheduleRefresh();
+      });
+      input.addEventListener("blur", () => void refresh("blur"));
+    }
+  }
+
+  const boxes = h("div", { class: "addr-fields" },
+    parts.filter((part) => part !== "key").map((part) =>
+      h("div", { class: "field" }, h("label", { for: inputs[part].id }, PART_LABEL[part]), inputs[part], lists[part])));
+  element.append(boxes);
+
+  if (needKey) {
+    element.append(h("div", { class: "field" }, h("label", { for: inputs.key.id }, "Key name"), inputs.key, lists.key));
+  }
+  element.append(readout, note, chips, error);
+
+  // Ask once up front: a form that opens with boxes already filled — or empty
+  // and waiting — should show what the address is, and what the vault already
+  // has, rather than staying blank until the first keystroke. The answer
+  // arrives after the dialog is in the document, which is what `refresh`
+  // requires before it paints.
+  void refresh();
+
+  return {
+    element,
+    value,
+    /** The address as the server last saw it, and whether it's usable. */
+    state: () => preview,
+    isValid: () => Boolean(preview && preview.valid),
+    /** True once a person has typed in it — prefills must not overwrite that. */
+    isTouched: () => touched,
+    /** Fills boxes that are still empty; used to seed an environment from a .env. */
+    fill(seed) {
+      for (const [part, wanted] of Object.entries(seed)) {
+        if (inputs[part] && fields[part].trim() === "") fields[part] = wanted;
+      }
+      sync();
+      void refresh();
+    },
+    setError,
+    refresh: () => refresh(),
+  };
 }
 
 // ---------------------------------------------------------------------------
 // Dialogs
 // ---------------------------------------------------------------------------
 
-function secretDialog({ environment = "", key = "", replacing = false } = {}) {
+function secretDialog({ draft = {}, key = "", replacing = false } = {}) {
   openDialog((close) => {
-    const envInput = h("input", { id: "f-env", class: "mono", value: environment, placeholder: "mcpm://acme/api/dev", list: "env-list", autocomplete: "off", spellcheck: "false", readonly: replacing || undefined });
-    const keyInput = h("input", { id: "f-key", class: "mono", value: key, placeholder: "STRIPE_KEY", autocomplete: "off", spellcheck: "false", readonly: replacing || undefined });
-    const valueInput = h("input", { id: "f-value", type: "password", autocomplete: "off", spellcheck: "false", autofocus: replacing || Boolean(environment && key) || undefined });
-    const envField = field("Environment", envInput);
-    const keyField = field("Key", keyInput);
+    const builder = addressBuilder({ initial: { ...draft, ...(key ? { key } : {}) }, needKey: true, readonly: replacing, autofocusFirst: !key });
+    const valueInput = h("input", { id: "f-value", type: "password", autocomplete: "off", spellcheck: "false", autofocus: Boolean(key) || undefined });
     const valueField = field(replacing ? "New value" : "Value", valueInput, "Stored encrypted on this machine. It's never shown again, here or anywhere else. To change it, replace it.");
     const submit = h("button", { class: "btn btn-primary", type: "submit" }, replacing ? "Replace" : "Save");
 
-    const form = h("form", {
+    return h("form", {
       onsubmit: async (e) => {
         e.preventDefault();
-        const env = envInput.value.trim().replace(/\/$/, "");
-        const name = keyInput.value.trim();
-        const envError = checkEnvironment(env);
-        const keyError = !name ? "Enter a key name" : KEY_RE.test(name) ? null : "Letters, digits and _ only, not starting with a digit";
-        const valueError = valueInput.value === "" ? "Enter a value" : null;
-        envField.setError(envError);
-        keyField.setError(keyError);
-        valueField.setError(valueError);
-        if (envError || keyError || valueError) return;
+        if (valueInput.value === "") return valueField.setError("Enter a value");
+        // Ask what the boxes mean *now* rather than trusting whatever the last
+        // debounced keystroke answered — a form submitted the instant it's
+        // filled would otherwise be judged by a preview that hasn't landed yet.
+        await builder.refresh();
+        if (!builder.isValid()) return builder.setError("Finish the address first — the boxes above say what's missing");
         submit.disabled = true;
         try {
-          const result = await api("POST", "/api/secrets", { address: `${env}/${name}`, value: valueInput.value });
+          const result = await api("POST", "/api/secrets", { fields: builder.value(), value: valueInput.value });
           valueInput.value = "";
           close();
-          toast(result.created ? `Stored ${name}` : `Replaced ${name}`);
-          await refresh();
+          toast(result.created ? `Stored ${result.address.split("/").pop()}` : `Replaced ${result.address.split("/").pop()}`);
+          reload();
         } catch (error) {
-          valueField.setError(error.message);
+          builder.setError(error.message);
           submit.disabled = false;
         }
       },
@@ -251,40 +472,150 @@ function secretDialog({ environment = "", key = "", replacing = false } = {}) {
       h("p", { class: "desc" }, replacing
         ? "The old value is overwritten. Anything that references this address picks up the new one on its next run."
         : "Your .env then holds its address instead of the value, and mcpv run injects it."),
-      environmentList(),
-      h("div", { class: "field-row" }, envField.wrap, keyField.wrap),
+      builder.element,
       valueField.wrap,
       h("div", { class: "dialog-actions" }, h("button", { type: "button", class: "btn", onclick: close }, "Cancel"), submit));
-    return form;
   });
 }
 
 function importDialog() {
   openDialog((close) => {
-    const envInput = h("input", { id: "i-env", class: "mono", placeholder: "mcpm://acme/api/dev", list: "env-list", autocomplete: "off", spellcheck: "false" });
+    const projectFile = data.check?.file ?? null;
+    const builder = addressBuilder({ initial: {}, needKey: false, autofocusFirst: false });
+    // Two ways in, because they are different in an important way: this
+    // folder's .env is read by mcpv itself, so no value ever crosses the
+    // socket, while a chosen file is read by the browser and posted.
+    const source = h("div", { class: "source" });
+    // A real, visible file input — not the usual hidden input plus a styled
+    // button that calls .click() on it. That pattern needs the browser to open
+    // a dialog for a control it was told not to render, which some refused,
+    // and it needs an `accept` filter to be satisfied, which `.env` can't do:
+    // a dotfile has no MIME type and `.env.production` matches no extension
+    // token, so the dialog showed the file a person needed greyed out and
+    // unselectable. There is no filter now, and the control is one they click
+    // themselves. What comes in is parsed and validated by the server, which
+    // is where a wrong file gets caught.
+    const picker = h("input", { type: "file", id: "i-file", class: "file-input", multiple: false, "aria-label": "Choose a .env file" });
     const textInput = h("textarea", { id: "i-text", spellcheck: "false", placeholder: "DATABASE_URL=postgres://…\nSTRIPE_KEY=sk_live_…" });
     const onlyInput = h("input", { id: "i-only", class: "mono", placeholder: "DATABASE_URL, STRIPE_KEY", autocomplete: "off", spellcheck: "false" });
-    const envField = field("Into environment", envInput);
-    const textField = field(".env contents", textInput, "Paste the file. Empty values and existing mcpm:// references are skipped.");
-    const onlyField = field("Only these keys (optional)", onlyInput, "Leave empty to import every plain value. Keep settings like PORT out if they aren't secret.");
+    const planLine = h("div", { class: "plan-line" });
+    const textField = field(".env contents", textInput);
+    const onlyField = field("Only these keys (optional)", onlyInput, "Leave empty to import every plain value. Keep things like PORT out if they aren't secret.");
     const submit = h("button", { class: "btn btn-primary", type: "submit" }, "Import");
+    let mode = projectFile ? "project" : "text";
+    let seeded = false;
+
+    const choice = (value, label, hint) =>
+      h("label", { class: `source-option ${mode === value ? "active" : ""}` },
+        h("input", { type: "radio", name: "import-source", value, checked: mode === value, onchange: () => setMode(value) }),
+        h("span", {}, h("b", {}, label), hint && h("span", { class: "note" }, ` ${hint}`)));
+
+    function setMode(value) {
+      mode = value;
+      renderSource();
+      void plan();
+    }
+
+    function renderSource() {
+      const projectOption = projectFile
+        ? choice("project", "./.env in this folder", "read by mcpv — values stay on this machine")
+        : null;
+      const textOption = choice("text", projectFile ? "A file or pasted text" : "Choose a file or paste text",
+        "read by your browser, then sent to the local mcpv process");
+      source.replaceChildren(...[projectOption, textOption].filter(Boolean));
+      // Both hidden with the `hidden` property, which is fine here because
+      // nothing ever calls .click() on either of them.
+      textField.wrap.hidden = mode !== "text";
+      picker.hidden = mode !== "text";
+    }
+
+    // Reading the chosen file happens in the browser: the file input yields
+    // contents and a name, never a path, so no route ever accepts "read this
+    // path for me" — the request that would make this page worth attacking.
+    // The contents land in the textarea, so what will be imported is what can
+    // be read on screen before the button is pressed.
+    async function loadFile(file) {
+      if (!file) return;
+      if (file.size > 900 * 1024) {
+        textField.setError(`${file.name} is ${bytes(file.size)} — too large to send in one go (900 KB max). Delete what it doesn't need, or paste the keys you want.`);
+        return;
+      }
+      textField.setError(null);
+      try {
+        textInput.value = await file.text();
+        void plan();
+      } catch {
+        textField.setError(`Couldn't read ${file.name} — choose it again, or paste the contents below`);
+      }
+    }
+
+    picker.addEventListener("change", () => void loadFile(picker.files && picker.files[0]));
+    textInput.addEventListener("dragover", (e) => { e.preventDefault(); textInput.classList.add("dropping"); });
+    textInput.addEventListener("dragleave", () => textInput.classList.remove("dropping"));
+    textInput.addEventListener("drop", (e) => {
+      e.preventDefault();
+      textInput.classList.remove("dropping");
+      const file = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) void loadFile(file);
+    });
+
+    // What this would do, before anything is stored. The answer names keys and
+    // counts; the values in the request (for a pasted .env) are dropped unread,
+    // and for this folder's .env they never leave the process at all.
+    async function plan() {
+      const body = mode === "project" ? { source: "project" } : { text: textInput.value };
+      if (mode === "text" && textInput.value.trim() === "") {
+        planLine.replaceChildren();
+        return;
+      }
+      let result;
+      try {
+        result = await api("POST", "/api/import/preview", body);
+      } catch (error) {
+        planLine.replaceChildren(h("span", { class: "field-error" }, error.message));
+        return;
+      }
+      if (!planLine.isConnected) return;
+      if (result.error) {
+        planLine.replaceChildren(h("span", { class: "field-error" }, result.error));
+        return;
+      }
+      const bits = [h("span", { class: "badge ok" }, `${plural(result.plain.length, "plain value")} to store`)];
+      if (result.references.length) bits.push(h("span", { class: "badge" }, `${plural(result.references.length, "reference")} already in the vault`));
+      if (result.skipped.length) bits.push(h("span", { class: "badge" }, `${plural(result.skipped.length, "empty value")} skipped`));
+      planLine.replaceChildren(...bits);
+      // A .env that already holds references knows which environment it
+      // belongs to: use what the file says instead of asking again.
+      if (result.environment && !seeded && !builder.isTouched()) {
+        seeded = true;
+        builder.fill(draftFrom(result.environment));
+      }
+    }
+
+    const debouncedPlan = debounce(() => void plan(), 350);
+    textInput.addEventListener("input", debouncedPlan);
+
+    renderSource();
+    void plan();
 
     return h("form", {
       onsubmit: async (e) => {
         e.preventDefault();
-        const env = envInput.value.trim().replace(/\/$/, "");
-        const envError = checkEnvironment(env);
-        envField.setError(envError);
-        textField.setError(textInput.value.trim() ? null : "Paste the contents of a .env file");
-        if (envError || !textInput.value.trim()) return;
+        if (mode === "text" && textInput.value.trim() === "") return textField.setError("Choose a .env file, or paste its contents");
+        await builder.refresh();
+        if (!builder.isValid()) return builder.setError("Finish the address first — the boxes above say what's missing");
         const only = onlyInput.value.split(",").map((k) => k.trim()).filter(Boolean);
         submit.disabled = true;
         try {
-          const result = await api("POST", "/api/import", { environment: env, text: textInput.value, ...(only.length ? { only } : {}) });
+          const result = await api("POST", "/api/import", {
+            ...(mode === "project" ? { source: "project" } : { text: textInput.value }),
+            fields: builder.value(),
+            ...(only.length ? { only } : {}),
+          });
           textInput.value = "";
           close();
-          toast(`Imported ${plural(result.keys.length, "secret")} into ${env}`);
-          await refresh();
+          toast(`Imported ${plural(result.keys.length, "secret")} into ${result.environment}`);
+          reload();
         } catch (error) {
           textField.setError(error.message);
           submit.disabled = false;
@@ -292,10 +623,14 @@ function importDialog() {
       },
     },
       h("h2", {}, "Import a .env"),
-      h("p", { class: "desc" }, "Values are encrypted into the vault. No file on disk is changed. To swap a .env's values for references, run ",
+      h("p", { class: "desc" }, "Values are encrypted into the vault; no file on disk is changed. To swap a .env's own values for references, run ",
         h("code", {}, "mcpv import .env --into <env> --rewrite"), " in your terminal."),
-      environmentList(),
-      envField.wrap, textField.wrap, onlyField.wrap,
+      source,
+      h("div", { class: "file-row" }, picker, h("span", { class: "note" }, "or drop a file on the box below, or paste it")),
+      textField.wrap,
+      planLine,
+      builder.element,
+      onlyField.wrap,
       h("div", { class: "dialog-actions" }, h("button", { type: "button", class: "btn", onclick: close }, "Cancel"), submit));
   });
 }
@@ -310,7 +645,7 @@ async function removeSecret(address, name) {
   try {
     await api("POST", "/api/secrets/delete", { address });
     toast(`Deleted ${name}`);
-    await refresh();
+    reload();
   } catch (error) {
     toast(error.message, "fail");
   }
@@ -327,12 +662,16 @@ async function shutdown() {
 
 const STORE_LABEL = { keychain: "Key in macOS Keychain", "secret-service": "Key in system keyring", file: "Key in a local file" };
 
+// The list's filters and page. Kept here rather than in the DOM so a refresh
+// after adding a secret doesn't drop the person back to page 1 of everything.
+const view = { search: "", workspace: "", project: "", environment: "", page: 1, pageSize: 25 };
+
 function topbar() {
   return h("header", { class: "topbar" },
     h("div", { class: "brand" }, h("img", { src: "/logo.svg", alt: "" }), "mcpv"),
     h("span", { class: "note mono vault-path" }, data.state?.home ?? ""),
     h("span", { class: "spacer" }),
-    h("button", { class: "btn btn-sm btn-ghost", onclick: () => refresh(true), "aria-label": "Refresh" }, icon("refresh")),
+    h("button", { class: "btn btn-sm btn-ghost", onclick: () => reload(true), "aria-label": "Refresh" }, icon("refresh")),
     h("button", { class: "btn btn-sm", onclick: shutdown }, icon("power"), "Close"));
 }
 
@@ -356,7 +695,7 @@ function projectCard(check) {
           h("span", { class: `status-dot ${ref.found ? "ok" : "fail"}`, "aria-label": ref.found ? "Resolves" : "Missing" }),
           h("div", { class: "grow" }, h("span", { class: "name" }, ref.key), h("span", { class: "when mono" }, ref.address)),
           ref.found ? null : h("div", { class: "row-actions" },
-            h("button", { class: "btn btn-sm btn-primary", onclick: () => secretDialog({ environment: env, key: name }) }, "Set value")));
+            h("button", { class: "btn btn-sm btn-primary", onclick: () => secretDialog({ draft: draftFrom(env), key: name }) }, "Set value")));
       })));
 }
 
@@ -365,35 +704,142 @@ function splitAddress(address) {
   return [address.slice(0, i), address.slice(i + 1)];
 }
 
-function environmentCard(env) {
-  return h("section", { class: "card" },
+function draftFrom(path) {
+  const read = path.replace(/^mcpm:\/\//, "").replace(/\/$/, "").split("/");
+  return { workspace: read[0] ?? "", project: read[1] ?? "", environment: read[2] ?? "" };
+}
+
+/** Every environment in the vault, with counts — the strip above the list. */
+function environmentStrip(environments) {
+  if (environments.length === 0) return null;
+  const shown = environments.slice(0, 8);
+  return h("section", { class: "card strip" },
     h("div", { class: "card-head" },
-      h("span", { class: "address" }, env.address),
-      h("span", { class: "badge" }, plural(env.keys.length, "key")),
+      h("h2", {}, "Environments"),
       h("span", { class: "spacer" }),
-      h("button", { class: "btn btn-sm btn-ghost", onclick: () => copy(env.address, "Copied the environment address") }, icon("copy"), "Copy"),
-      h("button", { class: "btn btn-sm", onclick: () => secretDialog({ environment: env.address }) }, icon("plus"), "Add")),
-    h("ul", { class: "rows" }, env.keys.map((key) => {
-      const address = `${env.address}/${key.name}`;
-      return h("li", { class: "row" },
-        h("div", { class: "grow" },
-          h("span", { class: "name" }, key.name),
-          h("span", { class: "when" }, key.updatedAt ? `Updated ${ago(key.updatedAt)}` : "")),
-        h("span", { class: "masked", "aria-label": "Value hidden" }, "••••••••"),
-        h("div", { class: "row-actions" },
-          h("button", { class: "btn btn-sm btn-ghost", title: "Copy a .env line that references it", onclick: () => copy(`${key.name}=${address}`, `Copied ${key.name}=… reference`) }, icon("copy"), "Reference"),
-          h("button", { class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Replace ${key.name}`, title: "Replace value", onclick: () => secretDialog({ environment: env.address, key: key.name, replacing: true }) }, icon("edit")),
-          h("button", { class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Delete ${key.name}`, title: "Delete", onclick: () => removeSecret(address, key.name) }, icon("trash"))));
+      environments.length > shown.length ? h("span", { class: "note" }, `showing ${shown.length} of ${environments.length} — use the Environment filter for the rest`) : null),
+    h("div", { class: "env-chips" }, shown.map((env) => {
+      const draft = draftFrom(env.address);
+      const active = view.workspace === draft.workspace && view.project === draft.project && view.environment === draft.environment;
+      return h("div", { class: `env-chip ${active ? "active" : ""}` },
+        h("button", {
+          type: "button",
+          class: "env-chip-main mono",
+          title: `Filter the list to ${env.address}`,
+          onclick: () => setFilters({ ...draft, page: 1 }),
+        }, h("span", {}, env.address.replace(/^mcpm:\/\//, "")), h("span", { class: "count" }, String(env.keys.length))),
+        h("button", { type: "button", class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Copy ${env.address}`, title: "Copy the environment address", onclick: () => copy(env.address, "Copied the environment address") }, icon("copy")),
+        h("button", { type: "button", class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Add a secret to ${env.address}`, title: "Add a secret here", onclick: () => secretDialog({ draft }) }, icon("plus")));
     })));
+}
+
+function selectOptions(values, allLabel) {
+  return [h("option", { value: "" }, allLabel), ...values.map((value) => h("option", { value }, value))];
+}
+
+function toolbar(page, facets) {
+  const search = h("input", {
+    id: "q",
+    type: "search",
+    class: "search",
+    value: view.search,
+    placeholder: "Search key names and addresses",
+    autocomplete: "off",
+    spellcheck: "false",
+    "aria-label": "Search secrets",
+  });
+  search.addEventListener("input", debounce(() => setFilters({ search: search.value }), 200));
+
+  const picker = (name, label, values) => {
+    const select = h("select", { class: "select", "aria-label": label, onchange: (e) => setFilters({ [name]: e.target.value }) }, selectOptions(values, label));
+    select.value = view[name];
+    return select;
+  };
+
+  // Options narrow with the boxes to their left, so a project list can't offer
+  // something that doesn't exist under the chosen workspace.
+  const projects = facets.rows.filter((row) => !view.workspace || row.workspace === view.workspace);
+  const environments = projects.filter((row) => !view.project || row.project === view.project);
+  const dirty = Boolean(view.search || view.workspace || view.project || view.environment);
+
+  return h("div", { class: "toolbar" },
+    h("div", { class: "toolbar-row" },
+      h("div", { class: "search-wrap" }, icon("search"), search),
+      picker("workspace", "All workspaces", facets.workspaces),
+      picker("project", "All projects", [...new Set(projects.map((row) => row.project))]),
+      picker("environment", "All environments", [...new Set(environments.map((row) => row.environment))]),
+      dirty ? h("button", { class: "btn btn-sm btn-ghost", onclick: () => setFilters({ search: "", workspace: "", project: "", environment: "" }) }, "Clear") : null),
+    h("div", { class: "toolbar-row pager-row" },
+      h("span", { class: "note" }, page.total === 0
+        ? "No secrets match"
+        : `Showing ${page.from}–${page.to} of ${plural(page.total, "secret")}`),
+      h("span", { class: "spacer" }),
+      h("label", { class: "note per-page" }, "Per page",
+        h("select", { class: "select", "aria-label": "Secrets per page", onchange: (e) => setFilters({ pageSize: Number(e.target.value), page: 1 }) },
+          [25, 50, 100].map((size) => h("option", { value: String(size), selected: view.pageSize === size }, String(size))))),
+      page.pages > 1 ? h("div", { class: "pager" },
+        h("button", { class: "btn btn-sm icon-btn", "aria-label": "Previous page", disabled: page.page <= 1, onclick: () => goTo(page.page - 1) }, icon("left")),
+        h("span", { class: "note" }, `Page ${page.page} of ${page.pages}`),
+        h("button", { class: "btn btn-sm icon-btn", "aria-label": "Next page", disabled: page.page >= page.pages, onclick: () => goTo(page.page + 1) }, icon("right"))) : null));
+}
+
+function secretRow(row) {
+  return h("li", { class: "row" },
+    h("div", { class: "grow" },
+      h("span", { class: "name" }, row.key),
+      h("span", { class: "when mono" }, row.path)),
+    h("span", { class: "when" }, row.updatedAt ? `Updated ${ago(row.updatedAt)}` : ""),
+    h("span", { class: "masked", "aria-label": "Value hidden" }, "••••••••"),
+    h("div", { class: "row-actions" },
+      h("button", { class: "btn btn-sm btn-ghost", title: "Copy a .env line that references it", onclick: () => copy(`${row.key}=${row.address}`, `Copied ${row.key}=… reference`) }, icon("copy"), "Reference"),
+      h("button", { class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Replace ${row.key}`, title: "Replace value", onclick: () => secretDialog({ draft: draftFrom(`mcpm://${row.path}`), key: row.key, replacing: true }) }, icon("edit")),
+      h("button", { class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Delete ${row.key}`, title: "Delete", onclick: () => removeSecret(row.address, row.key) }, icon("trash"))));
+}
+
+function facetsFrom(environments) {
+  const rows = [];
+  for (const env of environments) {
+    const draft = draftFrom(env.address);
+    if (draft.workspace && draft.project && draft.environment) rows.push(draft);
+  }
+  return { rows, workspaces: [...new Set(rows.map((row) => row.workspace))].sort() };
 }
 
 function render() {
   const app = document.getElementById("app");
-  const { state, check } = data;
-  const count = state.environments.reduce((n, env) => n + env.keys.length, 0);
+  const { state, check, page } = data;
+  const total = state.environments.reduce((n, env) => n + env.keys.length, 0);
   const actions = h("div", { class: "actions" },
     h("button", { class: "btn", onclick: importDialog }, icon("upload"), "Import .env"),
     h("button", { class: "btn btn-primary", onclick: () => secretDialog() }, icon("plus"), "Add secret"));
+
+  const body = [];
+  if (total === 0) {
+    body.push(h("section", { class: "card empty" },
+      h("b", {}, "No secrets yet"),
+      h("p", {}, "Add one, or import an existing .env. Then point your .env at mcpm:// addresses and start your app with mcpv run."),
+      h("div", { class: "actions" },
+        h("button", { class: "btn", onclick: importDialog }, icon("upload"), "Import .env"),
+        h("button", { class: "btn btn-primary", onclick: () => secretDialog() }, icon("plus"), "Add secret"))));
+  } else {
+    body.push(environmentStrip(state.environments));
+    body.push(toolbar(page, facetsFrom(state.environments)));
+    body.push(h("section", { class: "card list-card" },
+      page.items.length === 0
+        ? h("div", { class: "empty quiet" },
+          h("b", {}, "Nothing matches"),
+          h("p", {}, "Try a shorter search, or clear the filters."),
+          h("div", { class: "actions" }, h("button", { class: "btn", onclick: () => setFilters({ search: "", workspace: "", project: "", environment: "" }) }, "Clear filters")))
+        : h("ul", { class: "rows" }, page.items.map(secretRow))));
+  }
+
+  // The search box is re-created by this render, so whichever control the
+  // person is in has to be put back — otherwise typing a search term would
+  // lose the caret on the first keystroke that triggers a request.
+  const focused = document.activeElement;
+  const restore = focused && focused.id && app.contains(focused)
+    ? { id: focused.id, start: focused.selectionStart, end: focused.selectionEnd }
+    : null;
 
   app.replaceChildren(
     topbar(),
@@ -402,18 +848,22 @@ function render() {
         h("div", { class: "grow" },
           h("h1", {}, "Secrets"),
           h("p", {}, "Encrypted on this machine. Values are never shown here. Agents use them through ", h("code", {}, "mcpv run"), ".")),
-        count ? actions : null),
+        total ? actions : null),
       state.keyStore ? h("div", { class: "meta" },
         h("span", { class: `badge ${state.keyStore === "file" ? "warn" : "ok"}` }, STORE_LABEL[state.keyStore] ?? state.keyStore),
-        h("span", { class: "badge" }, `${plural(state.environments.length, "environment")} · ${plural(count, "secret")}`)) : null,
+        h("span", { class: "badge" }, `${plural(state.environments.length, "environment")} · ${plural(total, "secret")}`)) : null,
       projectCard(check),
-      count === 0
-        ? h("section", { class: "card empty" },
-          h("b", {}, "No secrets yet"),
-          h("p", {}, "Add one, or import an existing .env. Then point your .env at mcpm:// addresses and start your app with mcpv run."),
-          h("div", { class: "actions" }, h("button", { class: "btn", onclick: importDialog }, icon("upload"), "Import .env"),
-            h("button", { class: "btn btn-primary", onclick: () => secretDialog() }, icon("plus"), "Add secret")))
-        : state.environments.map(environmentCard)));
+      body));
+
+  if (restore) {
+    const next = document.getElementById(restore.id);
+    if (next) {
+      next.focus();
+      if (restore.start !== null && next.setSelectionRange) {
+        try { next.setSelectionRange(restore.start, restore.end); } catch { /* not a text field */ }
+      }
+    }
+  }
 }
 
 function showEnded() {
@@ -429,11 +879,54 @@ function showEnded() {
     h("span", {}, "Nothing is running in the background. To open it again, run ", h("code", {}, "mcpv ui"), " in your terminal.")));
 }
 
+async function loadPage() {
+  const query = new URLSearchParams();
+  if (view.search) query.set("search", view.search);
+  if (view.workspace) query.set("workspace", view.workspace);
+  if (view.project) query.set("project", view.project);
+  if (view.environment) query.set("environment", view.environment);
+  query.set("page", String(view.page));
+  query.set("limit", String(view.pageSize));
+  return api("GET", `/api/secrets?${query.toString()}`);
+}
+
+/** Filters and paging are the server's job (same code as `mcpv list`), so a
+ *  change here is a re-request, not a re-implementation. */
+function setFilters(next) {
+  Object.assign(view, next);
+  // Narrowing what's shown starts the list over; moving to another page (or
+  // changing the page size, which sets page explicitly) does not.
+  if (next.page === undefined) view.page = 1;
+  reload();
+}
+
+function goTo(pageNumber) {
+  view.page = pageNumber;
+  reload();
+}
+
+let loadSeq = 0;
+
 async function refresh(announce = false) {
-  const [state, check] = await Promise.all([api("GET", "/api/state"), api("GET", "/api/check")]);
-  data = { state, check };
+  const mine = ++loadSeq;
+  const [state, check, page] = await Promise.all([api("GET", "/api/state"), api("GET", "/api/check"), loadPage()]);
+  if (mine !== loadSeq) return; // a later request already won
+  data = { state, check, page };
+  if (page.page !== view.page) view.page = page.page; // the server clamps
   render();
   if (announce) toast("Up to date");
+}
+
+/**
+ * A reload triggered by something a person did. It never rejects: `refresh`
+ * throws so the boot path can show its own "couldn't open your vault" screen,
+ * and an unhandled rejection from a button click would be a console error and
+ * a stale list with no explanation.
+ */
+function reload(announce = false) {
+  return refresh(announce).catch((error) => {
+    if (!ended) toast(error.message, "fail");
+  });
 }
 
 if (!token) showEnded();

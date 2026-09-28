@@ -49,26 +49,9 @@ mcpv run --env mcpm://acme/api/prod -- ./migrate.sh
 
 # Safe for agents: key names only, never values
 mcpv check          # does every reference in ./.env resolve?
-mcpv list           # environments and key names
+mcpv list           # environments and key names, or search across them:
+mcpv list --search stripe --environment prod --limit 20 --page 2
 ```
-
-## Web UI
-
-```bash
-mcpv ui
-```
-
-This opens a local page in your browser. From it you can browse environments and key
-names, add or replace values, import a `.env`, delete secrets, and check that your
-project's `.env` references all resolve. It never shows a value, the same as the CLI.
-
-It only runs while you use it. It listens on 127.0.0.1 with a new token each time, and
-stops when you click Close, press Ctrl+C, or after 15 idle minutes. Nothing keeps
-running in the background.
-
-Also: `rm <address>` deletes a secret, `init` creates the vault, and `doctor` shows
-where the vault and its key are and whether it unlocks. `--json` works on `list`,
-`check` and `doctor`.
 
 ## Addresses
 
@@ -80,6 +63,67 @@ mcpm://<workspace>/<project>/<environment>/<KEY>    one secret
 Workspace, project and environment are lowercase slugs. `KEY` is an environment
 variable name. This is the same format hosted [mcpmaster](https://mcpmaster.com)
 Agent Secrets uses, so a `.env` of references works with either.
+
+**You rarely have to type that.** Every command reads an address the way you'd
+actually write one, and repairs what it can:
+
+```bash
+mcpv set Acme/API/Dev/STRIPE_KEY      # same address — case and the scheme are repaired
+mcpv set acme/api/dev/STRIPE_KEY/     # a trailing slash is punctuation
+mcpv list acme/api                    # a prefix lists everything under it
+```
+
+Stop early and it asks for the rest, one piece at a time, offering what already
+exists in the vault to pick from. Paste a whole address into any one of the
+prompts and it fills the rest. Off a terminal — in a script, or from an agent —
+it never prompts: it exits `2` naming the piece that's missing and the command
+that would have worked.
+
+```bash
+$ mcpv set acme/api/dev
+✗  "acme/api/dev" isn't a full address yet. Add a key — mcpm://acme/api/dev/{key}
+→  mcpv set mcpm://acme/api/dev/<KEY>
+```
+
+A `.env` reference is read the same way, so `mcpm://Acme/API/Dev/KEY` in a file
+resolves against the same secret as `mcpm://acme/api/dev/KEY`. Anything that
+doesn't start with `mcpm:` is left alone as a value — `LOG_PATH=var/log/app/err`
+is a path, not an address.
+
+## Web UI
+
+```bash
+mcpv ui
+```
+
+This opens a local page in your browser. From it you can browse environments and key
+names, add or replace values, import a `.env`, delete secrets, and check that your
+project's `.env` references all resolve. It never shows a value, the same as the CLI.
+
+Search and filter by workspace, project, environment or key name, and page through
+the result — the same matching rule `mcpv list` uses, so the page and the terminal
+never disagree about what a search found.
+
+**Import** takes either the `.env` beside where you started `mcpv ui`, any file you
+choose in the browser, or text you paste. It tells you what it would store — how many
+plain values, what it skips — before anything is written, and if the file already
+holds `mcpm://` references it fills the environment in from them.
+
+**Adding a secret** asks for the address as separate boxes — workspace, project,
+environment, key — with a live readout of the address they add up to. What the vault
+already has is offered as you go: pick an existing environment and the boxes fill
+themselves, or paste a whole `mcpm://…` address into any one box and it splits across
+them. A partial address says which piece is missing instead of refusing the lot, and
+a name it repairs (`Acme API` → `acme-api`) says so.
+
+It only runs while you use it. It listens on 127.0.0.1 with a new token each time, and
+stops when you click Close, press Ctrl+C, or after 15 idle minutes. Nothing keeps
+running in the background.
+
+Also: `rm <address>` deletes a secret, `init` creates the vault, and `doctor` shows
+where the vault and its key are and whether it unlocks. `--json` works on `list`,
+`check` and `doctor`. The `mcpm` CLI in this project talks to a hosted workspace
+instead; `mcpv` is the offline one.
 
 ## Using it with Claude Code (or any agent)
 
@@ -148,6 +192,48 @@ import { Vault, parseDotEnv, resolveDotEnv } from "@mcpmastersh/mcpv";
 const vault = Vault.open();
 const token = vault.resolveKey("mcpm://acme/api/dev/GITHUB_TOKEN"); // in memory, for your code to use
 ```
+
+## Troubleshooting
+
+### 1. Cached Registry Metadata
+
+npm caches registry responses. If `0.2.0` was published recently, your local cache
+might still believe `0.1.0` is the only version. Force an uncached install:
+
+```bash
+npm i -g @mcpmastersh/mcpv@0.2.0 --prefer-online
+```
+
+Or clear the cache entirely:
+
+```bash
+npm cache clean --force
+npm i -g @mcpmastersh/mcpv@0.2.0
+```
+
+### 2. An older copy answers first
+
+The new version can be installed and still not be the one that runs. `npm i -g`
+writes into whichever Node is active, and a second global copy can sit earlier on
+your `PATH` — another version manager's prefix, a `pnpm`/`yarn`/`bun` global, or
+Homebrew.
+
+```bash
+which -a mcpv           # every copy that would answer, in order
+mcpv --version          # the one that actually runs
+npm ls -g --depth=0     # what npm's global prefix holds
+```
+
+Install into the prefix that is actually first, or remove the stale copy. `npx`
+also keeps its own cache of everything it has run, so an occasional
+`npx @mcpmastersh/mcpv` can serve an old version:
+
+```bash
+npx --yes @mcpmastersh/mcpv@latest --version   # force the newest
+rm -rf ~/.npm/_npx                             # or drop npx's cache
+```
+
+The same two steps apply to any package installed globally, these ones included.
 
 ## License
 

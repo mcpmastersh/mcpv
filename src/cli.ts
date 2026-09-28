@@ -5,21 +5,48 @@
 // invocation was wrong). Storage lives in vault.ts, .env handling in
 // dotenv.ts, the child process in run.ts, presentation in term.ts.
 //
-// Two rules every command here keeps:
+// Three rules every command here keeps:
 //   - No command prints a secret value. There is no `get`/`reveal`; values go
 //     into a child process (`run`) and nowhere else.
 //   - No command takes a value as an argument. argv lands in shell history,
 //     in `ps`, and in an agent's transcript; values come in over stdin.
+//   - Every address a person types is read by address-input.ts before anything
+//     does with it — repaired, and on a terminal completed by asking for the
+//     piece that's missing. address.ts only ever sees the canonical grammar.
 
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { AddressError, parseEnvironmentAddress, parseKeyAddress } from "./address.ts";
-import { DotEnvError, parseDotEnv, references, resolveDotEnv, rewriteAsReferences } from "./dotenv.ts";
+import { AddressError, formatAddress } from "./address.ts";
+import {
+  PARTS,
+  addressDraft,
+  addressPreview,
+  completeDraft,
+  filterRows,
+  inventoryRows,
+  keyProblem,
+  missingNote,
+  normalizeKey,
+  paginate,
+  parseEnvironmentDraft,
+  parseKeyDraft,
+  readAddressInput,
+  slugProblem,
+  slugify,
+  suggestionsFor,
+  type AddressRead,
+  type Draft,
+  type Inventory,
+  type Part,
+  type SecretFilter,
+  type SecretRow,
+} from "./address-input.ts";
+import { DotEnvError, isReferenceValue, parseDotEnv, references, resolveDotEnv, rewriteAsReferences } from "./dotenv.ts";
 import { KeyError, availableOsStore, envKey, type KeyStore } from "./keys.ts";
 import { MIN_MASK_LENGTH } from "./mask.ts";
 import { CommandNotFoundError, runWithEnv } from "./run.ts";
 import { IDLE_MINUTES, startUi } from "./ui-server.ts";
-import { CliError, accent, action, bold, glyph, heading, muted, note, out, pad, row, say, setPlain } from "./term.ts";
+import { CliError, accent, action, arrow, bold, glyph, heading, muted, note, out, pad, row, say, setPlain } from "./term.ts";
 import { Vault, VaultError, readVaultFile, vaultHome } from "./vault.ts";
 import { VERSION } from "./version.ts";
 
@@ -30,7 +57,20 @@ import { VERSION } from "./version.ts";
 type Parsed = { positionals: string[]; rest: string[] | null; flags: Map<string, string[]> };
 
 /** Flags that take a value; everything else is boolean. */
-const VALUE_FLAGS = new Set(["env", "env-file", "into", "key-store", "only", "port"]);
+const VALUE_FLAGS = new Set([
+  "env",
+  "env-file",
+  "environment",
+  "into",
+  "key-store",
+  "limit",
+  "only",
+  "page",
+  "port",
+  "project",
+  "search",
+  "workspace",
+]);
 
 function parseArgs(argv: string[]): Parsed {
   const positionals: string[] = [];
@@ -129,6 +169,206 @@ function readEnvFile(path: string): string {
 }
 
 // ---------------------------------------------------------------------------
+// Addresses: read what was typed, ask for what's missing
+// ---------------------------------------------------------------------------
+//
+// address-input.ts holds the shared contract — it repairs case, spaces, a
+// missing scheme and a whole address pasted into one field, and when a piece is
+// genuinely absent it names that one piece. What's left is completing it here:
+// one question at a time, but only on a real terminal. Off one, a partial
+// address is a usage error (exit 2) naming the missing piece and the command
+// that would work, because a piped stdin must never turn into a prompt that
+// nothing is there to answer.
+
+const PART_LABEL: Record<Part, string> = { workspace: "Workspace", project: "Project", environment: "Environment", key: "Key name" };
+
+/** How many environments `list` shows per page unless --limit says otherwise. */
+const LIST_PAGE_SIZE = 20;
+
+/** A real terminal, and not a machine contract: `--json` output stays parseable. */
+function canAsk(p: Parsed): boolean {
+  return Boolean(process.stdin.isTTY) && !has(p, "json");
+}
+
+/** The vault's existing names, for suggesting what already exists. Nothing at all when there's no vault yet. */
+function inventoryOrEmpty(): Inventory {
+  return readVaultFile() ? Vault.open().inventory() : [];
+}
+
+/** A key address in its canonical form: the reader repairs, address.ts formats. */
+function canonicalKey(raw: string): string {
+  return formatAddress(parseKeyDraft(raw));
+}
+
+function canonicalEnvironment(raw: string): string {
+  return formatAddress(parseEnvironmentDraft(raw));
+}
+
+/** The copyable command a partial address was missing, e.g. `mcpv set mcpm://acme/api/dev/<KEY>`. */
+function hintFor(prefix: string, parts: Draft, needKey: boolean): string {
+  const wanted = needKey ? PARTS : PARTS.slice(0, 3);
+  const filled = wanted.map((part) => parts[part] ?? `<${part === "key" ? "KEY" : part.toUpperCase()}>`);
+  return `${prefix} mcpm://${filled.join("/")}`;
+}
+
+/** A partial address with nowhere to ask: what's missing, and the command that would have worked. */
+function partialAddressError(raw: string, read: AddressRead, hint: string, needKey: boolean): CliError {
+  const note = missingNote(read.missing, read.parts, needKey) ?? "Add the missing pieces";
+  return new CliError(`"${raw.trim()}" isn't a full address yet. ${note}`, [hint], 2);
+}
+
+let buffered = "";
+
+/**
+ * One line of visible input from a terminal. The caller writes the prompt to
+ * stderr; this only reads — and keeps whatever a paste delivered beyond the
+ * first newline, so the next question isn't answered by accident. stdin is
+ * paused on the way out so a finished command can't keep the process alive.
+ */
+async function readLine(): Promise<string> {
+  process.stdin.resume();
+  for (;;) {
+    const end = buffered.indexOf("\n");
+    if (end !== -1) {
+      const line = buffered.slice(0, end);
+      buffered = buffered.slice(end + 1);
+      process.stdin.pause();
+      return line.replace(/\r$/, "");
+    }
+    const chunk = await new Promise<string | null>((resolve) => {
+      const settle = (value: string | null) => {
+        process.stdin.off("data", onData);
+        process.stdin.off("end", onEnd);
+        resolve(value);
+      };
+      const onData = (data: Buffer) => settle(data.toString("utf8"));
+      const onEnd = () => settle(null);
+      process.stdin.on("data", onData);
+      process.stdin.on("end", onEnd);
+    });
+    if (chunk === null) {
+      const rest = buffered;
+      buffered = "";
+      process.stdin.pause();
+      return rest.replace(/\r$/, "");
+    }
+    buffered += chunk;
+  }
+}
+
+/**
+ * One question: the label, the vault's existing names as numbered picks, then a
+ * prompt on stderr. Enter takes the first pick, a number takes that one, and
+ * anything else is read as the name itself.
+ */
+async function askLine(label: string, suggestions: string[], hint: string): Promise<string> {
+  say(row("info", label, hint));
+  suggestions.forEach((suggestion, index) => say(`     ${muted(String(index + 1))}  ${accent(suggestion)}`));
+  process.stderr.write(`  ${arrow()} `);
+  return (await readLine()).trim();
+}
+
+function suggestionsForPart(part: Part, inventory: Inventory, draft: Draft): string[] {
+  const options = suggestionsFor(inventory, draft);
+  return { workspace: options.workspaces, project: options.projects, environment: options.environmentNames, key: options.keys }[part];
+}
+
+/** A `.env` path, asked for and validated by the same reader the flag path uses. */
+async function askEnvFile(): Promise<string> {
+  const suggestions = existsSync(".env") ? [".env"] : [];
+  for (;;) {
+    const answer = await askLine("File", suggestions, "a path to the .env holding plain values");
+    const candidate = answer === "" ? suggestions[0] : answer;
+    if (candidate === undefined || candidate === "") throw new CliError("Cancelled — nothing was imported", [], 1);
+    try {
+      readEnvFile(candidate);
+      return candidate;
+    } catch (error) {
+      say(row("warn", "File", (error as Error).message));
+    }
+  }
+}
+
+/**
+ * The missing pieces, in address order. Each answer is repaired exactly as an
+ * address segment is, and a whole address pasted into any of them fills the
+ * rest too — that is what somebody holding an address actually does with it.
+ */
+async function askMissing(command: string, draft: Draft, needKey: boolean): Promise<Draft> {
+  const inventory = inventoryOrEmpty();
+  const filled: Draft = { ...draft };
+  const wanted = needKey ? PARTS : PARTS.slice(0, 3);
+  say(heading(command, addressPreview(filled, needKey)));
+  say();
+  for (const part of wanted) {
+    if (filled[part] !== undefined) continue;
+    for (;;) {
+      const label = PART_LABEL[part];
+      const suggestions = suggestionsForPart(part, inventory, filled);
+      const answer = await askLine(label, suggestions, suggestions.length > 0 ? `Enter for ${suggestions[0]}, or type a name` : "type a name");
+      if (answer === "") {
+        if (suggestions.length === 0) throw new CliError(`Cancelled — nothing was ${command === "import" ? "imported" : "stored"}`, [], 1);
+        filled[part] = suggestions[0];
+        break;
+      }
+      if (/^[0-9]+$/.test(answer)) {
+        const pick = suggestions[Number(answer) - 1];
+        if (pick !== undefined) {
+          filled[part] = pick;
+          break;
+        }
+        say(row("warn", label, suggestions.length > 0 ? `pick 1–${suggestions.length}, or type a name` : "type a name, not a number"));
+        continue;
+      }
+      if (answer.includes("/") || /^mcpm:/i.test(answer)) {
+        const pasted = completeDraft({ [part]: answer }, { needKey });
+        if (pasted.unreadable.length > 0) {
+          say(row("warn", label, pasted.unreadable[0].why));
+          continue;
+        }
+        if (pasted.extra.length > 0) {
+          say(row("warn", label, `"${answer}" is longer than an address`));
+          continue;
+        }
+        for (const other of wanted) if (filled[other] === undefined && pasted.parts[other] !== undefined) filled[other] = pasted.parts[other];
+        break;
+      }
+      // A single name, repaired the same way the reader repairs a segment. What
+      // it was repaired to shows up in the final address, not as its own line.
+      const repaired = part === "key" ? normalizeKey(answer) : slugify(answer);
+      const why = part === "key" ? keyProblem(repaired) : slugProblem(repaired);
+      if (why === null) {
+        filled[part] = repaired;
+        break;
+      }
+      say(row("warn", label, why));
+    }
+  }
+  return filled;
+}
+
+/** An environment address from anything typed or asked for. Canonical on the way out. */
+async function readEnvironment(p: Parsed, raw: string, command: string): Promise<string> {
+  const read = readAddressInput(raw);
+  // Complete already, or wrong in a way the reader words better than we can
+  // (a stray segment, a personal ~me branch, a piece that can't be repaired):
+  // its own message names the offending piece, so let it throw.
+  if (read.unreadable.length > 0 || read.extra.length > 0 || read.missing.length === 0) return canonicalEnvironment(raw);
+  const hint = hintFor(`mcpv ${command}`, read.parts, false);
+  if (!canAsk(p)) throw partialAddressError(raw, read, hint, false);
+  return canonicalEnvironment(addressDraft(await askMissing(command, read.parts, false), false));
+}
+
+/** A one-key address the same way. Canonical on the way out. */
+async function readKey(p: Parsed, raw: string, command: string): Promise<string> {
+  const read = readAddressInput(raw, { needKey: true });
+  if (read.unreadable.length > 0 || read.extra.length > 0 || read.missing.length === 0) return canonicalKey(raw);
+  const hint = hintFor(`mcpv ${command}`, read.parts, true);
+  if (!canAsk(p)) throw partialAddressError(raw, read, hint, true);
+  return canonicalKey(addressDraft(await askMissing(command, read.parts, true), true));
+}
+
+// ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
@@ -159,75 +399,207 @@ function cmdInit(p: Parsed): void {
 
 async function cmdSet(p: Parsed): Promise<void> {
   const [address, ...extra] = p.positionals;
-  if (!address) usage("Which address?", "mcpv set mcpm://acme/api/dev/STRIPE_KEY");
-  if (extra.length) {
+  if (address !== undefined && extra.length) {
     throw new CliError(
       "Values are never taken as arguments — they'd land in shell history, `ps` and agent transcripts",
       [`mcpv set ${address}   # then paste at the hidden prompt`, `pbpaste | mcpv set ${address}`],
       2,
     );
   }
-  parseKeyAddress(address);
+  if (address === undefined && !canAsk(p)) usage("Which address?", "mcpv set mcpm://acme/api/dev/STRIPE_KEY");
+  // No address at all on a terminal is the guided flow: every piece, in order.
+  const canonical =
+    address === undefined
+      ? canonicalKey(addressDraft(await askMissing("set", {}, true), true))
+      : await readKey(p, address, "set");
   const { vault } = Vault.init();
-  const value = await readValue(`Value for ${accent(address)}`);
+  const value = await readValue(`Value for ${accent(canonical)}`);
   if (value === "") throw new CliError("Empty value — nothing was stored", [], 1);
-  const { created } = vault.set(address, value);
-  say(row("ok", created ? "Stored" : "Replaced", address));
+  const { created } = vault.set(canonical, value);
+  say(row("ok", created ? "Stored" : "Replaced", canonical));
 }
 
-function cmdImport(p: Parsed): void {
-  const [file] = p.positionals;
+async function cmdImport(p: Parsed): Promise<void> {
+  const [file, ...extra] = p.positionals;
+  if (extra.length) usage("Import takes one file", "mcpv import .env --into mcpm://acme/api/dev --rewrite");
   const into = flag(p, "into");
-  if (!file || !into) usage("Import needs a file and --into", "mcpv import .env --into mcpm://acme/api/dev --rewrite");
-  parseEnvironmentAddress(into);
-  const text = readEnvFile(file);
+  if ((file === undefined || into === undefined) && !canAsk(p)) {
+    usage("Import needs a file and --into", "mcpv import .env --into mcpm://acme/api/dev --rewrite");
+  }
+  // The file first, then the environment it goes into.
+  const path = file ?? (await askEnvFile());
+  const text = readEnvFile(path);
+  const target =
+    into === undefined
+      ? canonicalEnvironment(addressDraft(await askMissing("import", {}, false), false))
+      : await readEnvironment(p, into, `import ${path} --into`);
   const only = flag(p, "only")?.split(",").map((key) => key.trim()).filter(Boolean);
   const entries = parseDotEnv(text).filter(
-    (entry) => entry.value !== "" && !entry.value.startsWith("mcpm://") && (!only || only.includes(entry.key)),
+    (entry) => entry.value !== "" && !isReferenceValue(entry.value) && (!only || only.includes(entry.key)),
   );
   if (entries.length === 0) {
-    say(row("info", `No plain values in ${file} to import`));
+    say(row("info", `No plain values in ${path} to import`));
     return;
   }
   const { vault } = Vault.init();
-  const { created, updated } = vault.setMany(into, Object.fromEntries(entries.map((e) => [e.key, e.value])));
-  say(heading("import", into));
+  const { created, updated } = vault.setMany(target, Object.fromEntries(entries.map((e) => [e.key, e.value])));
+  say(heading("import", target));
   say();
   say(row("ok", `Imported ${plural(entries.length, "secret")}`, `${created} new, ${updated} replaced`));
   say(`     ${muted(entries.map((e) => e.key).join("  "))}`);
   if (has(p, "rewrite")) {
-    const mode = statSync(file).mode & 0o777;
-    writeFileSync(file, rewriteAsReferences(text, into, new Set(entries.map((e) => e.key))), { mode });
-    say(row("ok", `Rewrote ${file}`, "values replaced by mcpm:// references"));
+    const mode = statSync(path).mode & 0o777;
+    writeFileSync(path, rewriteAsReferences(text, target, new Set(entries.map((e) => e.key))), { mode });
+    say(row("ok", `Rewrote ${path}`, "values replaced by mcpm:// references"));
     say();
-    say(action(`mcpv run -- <your command>`, `reads ${file} and injects the values`));
+    say(action(`mcpv run -- <your command>`, `reads ${path} and injects the values`));
   } else {
     say();
-    say(note(`${file} still holds the plain values. --rewrite swaps them for references.`));
+    say(note(`${path} still holds the plain values. --rewrite swaps them for references.`));
   }
 }
 
+/** A whole number flag, defaulted. */
+function wholeNumber(raw: string | undefined, name: string, fallback: number): number {
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1) usage(`--${name} takes a whole number of 1 or more`, `mcpv list --${name} ${fallback}`);
+  return value;
+}
+
+/** An exact slug filter, repaired the way an address segment is. */
+function slugFilter(p: Parsed, name: "workspace" | "project" | "environment"): string | undefined {
+  const raw = flag(p, name);
+  if (raw === undefined) return undefined;
+  const slug = slugify(raw);
+  if (slug === "" || slugProblem(slug) !== null) usage(`--${name} takes a name like "acme"`, `mcpv list --${name} acme`);
+  return slug;
+}
+
+/**
+ * The positional is a prefix, so `mcpv list mcpm://acme` and `mcpv list acme/api`
+ * mean everything under that path rather than one full environment. A prefix
+ * that already names a key filters within the environment instead.
+ */
+function listPrefix(raw: string): { text: string; hasKey: boolean } {
+  const read = readAddressInput(raw);
+  if (read.unreadable.length > 0 || read.extra.length > 0) {
+    // Not address-shaped at all: the reader's own message names the piece.
+    parseEnvironmentDraft(raw);
+  }
+  const filled = PARTS.filter((part) => read.parts[part] !== undefined);
+  if (filled.length === 0) throw new CliError(`"${raw}" isn't an address or the start of one`, ["mcpv list"], 2);
+  return { text: filled.map((part) => read.parts[part]).join("/"), hasKey: read.parts.key !== undefined };
+}
+
+const matchesPrefix = (row: SecretRow, prefix: { text: string; hasKey: boolean }) =>
+  prefix.hasKey ? `${row.path}/${row.key}`.startsWith(prefix.text) : `${row.path}/${row.key}`.startsWith(`${prefix.text}/`);
+
+/** The grouped shape `list` has always printed: one entry per environment, names only. */
+function groupEnvironments(rows: SecretRow[]): { address: string; keys: string[] }[] {
+  const grouped = new Map<string, { address: string; keys: string[] }>();
+  for (const row of rows) {
+    const entry = grouped.get(row.path) ?? { address: `mcpm://${row.path}`, keys: [] };
+    entry.keys.push(row.key);
+    grouped.set(row.path, entry);
+  }
+  return [...grouped.values()];
+}
+
+/** A phrase for what a view was narrowed to, for the heading and the empty state. */
+function describeView(prefix: { text: string } | undefined, filter: SecretFilter): string {
+  const bits: string[] = [];
+  if (prefix) bits.push(`mcpm://${prefix.text}`);
+  if (filter.search) bits.push(`"${filter.search}"`);
+  if (filter.workspace) bits.push(`workspace ${filter.workspace}`);
+  if (filter.project) bits.push(`project ${filter.project}`);
+  if (filter.environment) bits.push(`environment ${filter.environment}`);
+  return bits.join(", ");
+}
+
+/** The same view one page further on, quoted so it can be pasted as-is. */
+function nextPage(p: Parsed, address: string | undefined, page: number): string {
+  const args = ["mcpv", "list"];
+  if (address !== undefined) args.push(address);
+  for (const name of ["search", "workspace", "project", "environment"] as const) {
+    const value = flag(p, name);
+    if (value !== undefined) args.push(`--${name}`, /[\s"'$]/.test(value) ? JSON.stringify(value) : value);
+  }
+  const limit = flag(p, "limit");
+  if (limit !== undefined) args.push("--limit", limit);
+  args.push("--page", String(page + 1));
+  return args.join(" ");
+}
+
 function cmdList(p: Parsed): void {
-  const [address] = p.positionals;
+  const [address, ...extra] = p.positionals;
+  if (extra.length) usage("List takes one address or prefix", "mcpv list mcpm://acme");
+  const prefix = address === undefined ? undefined : listPrefix(address);
+  const filter: SecretFilter = {
+    ...(flag(p, "search") === undefined ? {} : { search: flag(p, "search") }),
+    workspace: slugFilter(p, "workspace"),
+    project: slugFilter(p, "project"),
+    environment: slugFilter(p, "environment"),
+  };
+  const pageNumber = wholeNumber(flag(p, "page"), "page", 1);
+  const pageSize = wholeNumber(flag(p, "limit"), "limit", LIST_PAGE_SIZE);
+
   const vault = Vault.open();
-  const envs = address
-    ? [{ address: address.replace(/\/$/, ""), keys: vault.keys(address) ?? [] }]
-    : vault.environments();
+  const everything = inventoryRows(vault.inventory());
+  const matched = filterRows(everything, filter).filter((row) => prefix === undefined || matchesPrefix(row, prefix));
+  // One row per key, so an environment whose *address* matched keeps all of its
+  // keys while one that matched on a key name keeps just those — the shared
+  // filter already decided that per row, and grouping keeps the decision.
+  const environments = groupEnvironments(matched);
+  const secrets = environments.reduce((count, env) => count + env.keys.length, 0);
+  // Paging is over environments: a page is a few environments with all their keys.
+  const shown = paginate(environments, pageNumber, pageSize);
+  const subject = describeView(prefix, filter);
+
   if (has(p, "json")) {
-    out(JSON.stringify({ environments: envs }));
+    out(
+      JSON.stringify({
+        environments: shown.items,
+        total: shown.total,
+        page: shown.page,
+        pageSize: shown.pageSize,
+        pages: shown.pages,
+        secrets,
+        filters: {
+          ...(prefix === undefined ? {} : { prefix: prefix.text }),
+          ...(filter.search === undefined ? {} : { search: filter.search }),
+          ...(filter.workspace === undefined ? {} : { workspace: filter.workspace }),
+          ...(filter.project === undefined ? {} : { project: filter.project }),
+          ...(filter.environment === undefined ? {} : { environment: filter.environment }),
+        },
+      }),
+    );
     return;
   }
-  say(heading("list", address));
+
+  say(heading("list", subject === "" ? undefined : subject));
   say();
-  if (envs.length === 0 || envs.every((env) => env.keys.length === 0)) {
-    say(row("info", "Nothing stored yet"));
-    say();
-    say(action("mcpv set mcpm://<workspace>/<project>/<env>/<KEY>"));
+  if (shown.total === 0) {
+    if (everything.length === 0) {
+      say(row("info", "Nothing stored yet"));
+      say();
+      say(action("mcpv set mcpm://<workspace>/<project>/<env>/<KEY>"));
+    } else {
+      say(row("info", "Nothing matches", subject));
+      say();
+      say(action("mcpv list", "everything stored"));
+    }
     return;
   }
-  for (const env of envs) {
+  for (const env of shown.items) {
     say(`  ${accent(env.address)}  ${muted(plural(env.keys.length, "key"))}`);
     for (const key of env.keys) say(`     ${key}`);
+  }
+  say();
+  say(row("info", `${plural(shown.total, "environment")} · ${plural(secrets, "secret")}`, shown.pages > 1 ? `showing ${shown.from}–${shown.to} of ${shown.total}` : ""));
+  if (shown.page < shown.pages) {
+    say();
+    say(action(nextPage(p, address, shown.page), `${plural(shown.pages - shown.page, "more page")} of environments`));
   }
 }
 
@@ -242,6 +614,9 @@ function cmdCheck(p: Parsed): void {
   if (files.length === 0) usage("No .env here to check", "mcpv check --env-file .env.local");
   const vault = Vault.open();
   const results = files.flatMap((file) =>
+    // references() already returns the canonical form, so a .env whose
+    // address was typed with capitals is compared against the same vault entry
+    // as one written exactly.
     references(parseDotEnv(readEnvFile(file))).map((ref) => ({ file, key: ref.key, address: ref.address, found: vault.has(ref.address) })),
   );
   const missing = results.filter((r) => !r.found);
@@ -261,6 +636,18 @@ function cmdCheck(p: Parsed): void {
 }
 
 async function cmdRun(p: Parsed): Promise<void> {
+  // `run` injects a whole environment; the per-piece flags belong to `list`.
+  // Unknown flags are otherwise swallowed, so without this
+  // `run --environment dev -- npm test` would inject nothing and say nothing.
+  for (const name of ["workspace", "project", "environment"] as const) {
+    if (has(p, name)) {
+      throw new CliError(
+        `run doesn't take --${name} — a whole environment is injected with --env`,
+        [`mcpv run --env mcpm://acme/api/dev -- <command>`, `mcpv list --${name} ${flag(p, name)}`],
+        2,
+      );
+    }
+  }
   const command = p.rest;
   if (!command || command.length === 0) usage("Nothing to run — put the command after --", "mcpv run -- npm run dev");
   const vault = Vault.open();
@@ -270,7 +657,8 @@ async function cmdRun(p: Parsed): Promise<void> {
   // Order is precedence: whole environments first, then .env files in the
   // order given — a later source overrides an earlier one.
   for (const address of flags(p, "env")) {
-    for (const [key, value] of Object.entries(vault.resolveEnvironment(address))) {
+    const target = await readEnvironment(p, address, "run --env");
+    for (const [key, value] of Object.entries(vault.resolveEnvironment(target))) {
       env[key] = value;
       secretKeys.add(key);
     }
@@ -306,15 +694,17 @@ async function cmdRun(p: Parsed): Promise<void> {
 }
 
 async function cmdRemove(p: Parsed): Promise<void> {
-  const [address] = p.positionals;
+  const [address, ...extra] = p.positionals;
+  if (extra.length) usage("Remove takes one address", "mcpv rm mcpm://acme/api/dev/STRIPE_KEY");
   if (!address) usage("Which address?", "mcpv rm mcpm://acme/api/dev/STRIPE_KEY");
+  const canonical = await readKey(p, address, "rm");
   const vault = Vault.open();
-  if (!vault.has(address)) throw new CliError(`Nothing is stored at ${address}`, ["mcpv list"]);
-  if (!has(p, "yes") && !(await confirm(`Delete ${address}? This can't be undone.`))) {
-    throw new CliError(`Not deleted`, [`mcpv rm ${address} --yes`], process.stdin.isTTY ? 1 : 2);
+  if (!vault.has(canonical)) throw new CliError(`Nothing is stored at ${canonical}`, ["mcpv list"]);
+  if (!has(p, "yes") && !(await confirm(`Delete ${canonical}? This can't be undone.`))) {
+    throw new CliError("Not deleted", [`mcpv rm ${canonical} --yes`], process.stdin.isTTY ? 1 : 2);
   }
-  vault.remove(address);
-  say(row("ok", "Deleted", address));
+  vault.remove(canonical);
+  say(row("ok", "Deleted", canonical));
 }
 
 function cmdDoctor(p: Parsed): void {
@@ -435,18 +825,25 @@ function help(): void {
   say(`  ${bold("Usage")}`);
   cmd("run [--env-file f] -- <cmd>", "Run <cmd> with .env references resolved (default ./.env)");
   cmd("run --env <env-address> -- <cmd>", "Run <cmd> with a whole environment injected");
-  cmd("set <key-address>", "Store a secret (hidden prompt, or piped stdin)");
-  cmd("import <file> --into <env-address>", "Store a .env's plain values (--only A,B); --rewrite it to references");
+  cmd("set [key-address]", "Store a secret (hidden prompt, or piped stdin)");
+  cmd("import [file] --into <env>", "Store a .env's plain values (--only A,B); --rewrite it to references");
   cmd("check [--env-file f]", "Confirm every reference in a .env resolves (names only)");
-  cmd("list [env-address]", "List environments and key names — never values");
+  cmd("list [prefix]", "List environments and key names — never values");
+  cmd("list --search t --page n", "Search every key name and address; page the environments");
   cmd("rm <key-address>", "Delete a secret");
   cmd("init [--key-store s]", "Create the vault (keychain, secret-service or file)");
   cmd("ui [--port n] [--no-open]", "Open a local web UI: browse, add, replace, import. Never shows a value");
   cmd("doctor", "Where the vault and its key live, and whether it unlocks");
   say();
   say(`  ${bold("Addresses")}   ${muted("mcpm://<workspace>/<project>/<environment>[/<KEY>]")}`);
+  say(`              ${muted("acme/api/dev/STRIPE_KEY and Acme/API/Dev/STRIPE_KEY work too — case,")}`);
+  say(`              ${muted("a missing mcpm:// and a trailing / are repaired, never guessed at.")}`);
+  say(`              ${muted("A partial one is completed for you, piece by piece, on a terminal;")}`);
+  say(`              ${muted("off one it's an error naming the piece that's missing.")}`);
   say(`  ${bold("In a .env")}   ${muted("STRIPE_KEY=mcpm://acme/api/dev/STRIPE_KEY")}`);
   say();
+  say(`  ${bold("Filters")}     ${muted("list [prefix]  --workspace s  --project s  --environment s  --search text")}`);
+  say(`              ${muted("--limit n (environments per page, default " + LIST_PAGE_SIZE + ")  --page n")}`);
   say(`  ${bold("Flags")}       ${muted("--json (list, check, doctor)  --no-mask --quiet (run)  --only --rewrite (import)  --yes (rm)")}`);
   say(`  ${bold("Env")}         ${muted("MCPV_HOME  MCPV_KEY  MCPV_PLAIN  MCPV_ASCII  NO_COLOR")}`);
 }
@@ -468,6 +865,53 @@ const COMMANDS: Record<string, (p: Parsed) => void | Promise<void>> = {
   ui: cmdUi,
 };
 
+/**
+ * The flags each command actually reads.
+ *
+ * Anything else used to be swallowed silently, which is how `mcpv run
+ * --environment dev -- npm test` injected nothing and still exited 0, and how a
+ * mistyped `mcpv list --seach x` printed every secret as though the search had
+ * matched. "The invocation was wrong" is what exit 2 is for, so an unknown flag
+ * is now one — and where the flag does belong somewhere, the message says so.
+ *
+ * `run` lists the three per-piece flags even though it refuses them, so its own
+ * message (the one naming `--env`) is what gets printed instead of this table's
+ * generic line.
+ */
+const COMMAND_FLAGS: Record<string, string[]> = {
+  init: ["key-store"],
+  set: [],
+  import: ["into", "only", "rewrite"],
+  list: ["search", "workspace", "project", "environment", "limit", "page"],
+  ls: ["search", "workspace", "project", "environment", "limit", "page"],
+  check: ["env-file"],
+  run: ["env", "env-file", "no-mask", "quiet", "workspace", "project", "environment"],
+  rm: ["yes"],
+  doctor: [],
+  ui: ["port", "no-open"],
+};
+
+/**
+ * `--help`, `--plain` and `--json` belong to every command, not to one: `main`
+ * reads them before it dispatches, and `--json` is the promise that output is
+ * parseable and no question is ever asked — including on a command that has no
+ * JSON shape of its own yet. Each remaining flag does belong to one command.
+ */
+const GLOBAL_FLAGS = ["help", "plain", "json"];
+
+function rejectUnknownFlags(name: string, p: Parsed): void {
+  const allowed = new Set([...(COMMAND_FLAGS[name] ?? []), ...GLOBAL_FLAGS]);
+  for (const key of p.flags.keys()) {
+    if (allowed.has(key)) continue;
+    const owner = Object.entries(COMMAND_FLAGS).find(([command, list]) => command !== name && list.includes(key));
+    throw new CliError(
+      `${name} doesn't take --${key}${owner ? ` (it's a ${owner[0]} flag)` : ""}`,
+      [`mcpv ${name} --help`, "mcpv help"],
+      2,
+    );
+  }
+}
+
 export async function main(argv: string[]): Promise<void> {
   try {
     const [name, ...rest] = argv;
@@ -478,6 +922,7 @@ export async function main(argv: string[]): Promise<void> {
     const command = COMMANDS[name];
     if (!command) throw new CliError(`Unknown command: ${name}`, ["mcpv help"], 2);
     if (has(p, "help")) return help();
+    rejectUnknownFlags(name, p);
     await command(p);
   } catch (error) {
     report(error);
