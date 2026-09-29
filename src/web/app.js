@@ -878,17 +878,17 @@ function cheatSheet() {
   ]));
 }
 
-const CHEAT_KEY = "mcpv.cheat.closed";
+const CHEAT_KEY = "mcpv.cheat.open";
 
-/** Open unless the person closed it: these are the commands the page is for. */
+/** Collapsed unless the person opened it; their choice is remembered. */
 function cheatCard() {
-  let closed = false;
-  try { closed = localStorage.getItem(CHEAT_KEY) === "1"; } catch { /* storage blocked */ }
-  const details = h("details", { class: "card cheat-card", id: "commands", open: !closed },
+  let opened = false;
+  try { opened = localStorage.getItem(CHEAT_KEY) === "1"; } catch { /* storage blocked */ }
+  const details = h("details", { class: "card cheat-card", id: "commands", open: opened },
     h("summary", {}, h("h2", {}, "Command cheat sheet"), h("span", { class: "note" }, "Click a command to copy it")),
     cheatSheet());
   details.addEventListener("toggle", () => {
-    try { localStorage.setItem(CHEAT_KEY, details.open ? "0" : "1"); } catch { /* storage blocked */ }
+    try { localStorage.setItem(CHEAT_KEY, details.open ? "1" : "0"); } catch { /* storage blocked */ }
   });
   return details;
 }
