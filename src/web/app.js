@@ -669,8 +669,12 @@ const view = { search: "", workspace: "", project: "", environment: "", page: 1,
 function topbar() {
   return h("header", { class: "topbar" },
     h("div", { class: "brand" }, h("img", { src: "/logo.svg", alt: "" }), "mcpv"),
-    h("span", { class: "note mono vault-path" }, data.state?.home ?? ""),
+    h("nav", { class: "topnav", "aria-label": "On this page" },
+      h("a", { href: "#commands" }, "Commands"),
+      h("a", { href: "#project" }, ".env check"),
+      h("a", { href: "#secrets" }, "Secrets")),
     h("span", { class: "spacer" }),
+    h("span", { class: "note mono vault-path", title: "Where the vault lives" }, data.state?.home ?? ""),
     h("button", { class: "btn btn-sm btn-ghost", onclick: () => reload(true), "aria-label": "Refresh" }, icon("refresh")),
     h("button", { class: "btn btn-sm", onclick: shutdown }, icon("power"), "Close"));
 }
@@ -678,7 +682,7 @@ function topbar() {
 function projectCard(check) {
   if (!check?.file) return null;
   const missing = check.references.filter((r) => !r.found);
-  return h("section", { class: "card" },
+  return h("section", { class: "card", id: "project" },
     h("div", { class: "card-head" },
       h("h2", {}, "This project's .env"),
       check.error ? h("span", { class: "badge fail" }, "Can't read it")
@@ -858,8 +862,13 @@ const CHEAT_SHEET = [
   ["mcpv import .env --into mcpm://ws/proj/dev --rewrite", "Move a .env into the vault"],
   ["mcpv check", "Does every reference in ./.env resolve? Names only"],
   ["mcpv run -- <command>", "Run with your secrets; output is masked"],
+  ["mcpv run --env mcpm://ws/proj/dev -- <command>", "Run with a whole environment injected"],
   ["mcpv list", "Environments and key names, never values"],
+  ["mcpv list --search stripe", "Find a key by name across every environment"],
+  ["mcpv rm <address>", "Delete a secret"],
+  ["mcpv init", "Create the vault (keychain, secret-service or file)"],
   ["mcpv doctor", "Where the vault lives and whether it unlocks"],
+  ["mcpv update", "Install the newest version"],
 ];
 
 function cheatSheet() {
@@ -867,6 +876,21 @@ function cheatSheet() {
     h("dt", {}, h("button", { type: "button", class: "cheat-cmd mono", "aria-label": `Copy: ${cmd}`, onclick: () => copy(cmd, "Copied") }, cmd)),
     h("dd", {}, what),
   ]));
+}
+
+const CHEAT_KEY = "mcpv.cheat.closed";
+
+/** Open unless the person closed it: these are the commands the page is for. */
+function cheatCard() {
+  let closed = false;
+  try { closed = localStorage.getItem(CHEAT_KEY) === "1"; } catch { /* storage blocked */ }
+  const details = h("details", { class: "card cheat-card", id: "commands", open: !closed },
+    h("summary", {}, h("h2", {}, "Command cheat sheet"), h("span", { class: "note" }, "Click a command to copy it")),
+    cheatSheet());
+  details.addEventListener("toggle", () => {
+    try { localStorage.setItem(CHEAT_KEY, details.open ? "0" : "1"); } catch { /* storage blocked */ }
+  });
+  return details;
 }
 
 function guideCard() {
@@ -890,8 +914,7 @@ function guideCard() {
         h("p", {}, "Paste this into Claude Code, Codex or Cursor (or your project's instructions file):"),
         commandBlock(AGENT_LINE),
         expect("The agent runs your app through mcpv run, and asks you to add a key yourself when one is missing.")),
-    ),
-    h("details", { class: "cheat" }, h("summary", {}, "Command cheat sheet"), cheatSheet()));
+    ));
 }
 
 function render() {
@@ -912,7 +935,9 @@ function render() {
         h("button", { class: "btn", onclick: importDialog }, icon("upload"), "Import .env"),
         h("button", { class: "btn btn-primary", onclick: () => secretDialog() }, icon("plus"), "Add secret"))));
   } else {
-    body.push(environmentStrip(state.environments));
+    const strip = environmentStrip(state.environments);
+    if (strip) strip.id = "secrets";
+    body.push(strip);
     body.push(toolbar(page, facetsFrom(state.environments)));
     body.push(h("section", { class: "card list-card" },
       page.items.length === 0
@@ -921,7 +946,6 @@ function render() {
           h("p", {}, "Try a shorter search, or clear the filters."),
           h("div", { class: "actions" }, h("button", { class: "btn", onclick: () => setFilters({ search: "", workspace: "", project: "", environment: "" }) }, "Clear filters")))
         : h("ul", { class: "rows" }, page.items.map(secretRow))));
-    body.push(h("details", { class: "card cheat cheat-card" }, h("summary", {}, "Command cheat sheet"), cheatSheet()));
   }
 
   // The search box is re-created by this render, so whichever control the
@@ -943,6 +967,7 @@ function render() {
       state.keyStore ? h("div", { class: "meta" },
         h("span", { class: `badge ${state.keyStore === "file" ? "warn" : "ok"}` }, STORE_LABEL[state.keyStore] ?? state.keyStore),
         h("span", { class: "badge" }, `${plural(state.environments.length, "environment")} · ${plural(total, "secret")}`)) : null,
+      cheatCard(),
       projectCard(check),
       body));
 
