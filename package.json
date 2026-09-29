@@ -1,6 +1,6 @@
 {
   "name": "@mcpmastersh/mcpv",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Offline, encrypted secrets for AI agents. Commit .env files full of mcpm:// references; `mcpv run` resolves them in memory, injects them into one process and masks its output — the agent never sees a value.",
   "license": "Apache-2.0",
   "type": "module",
@@ -13,7 +13,9 @@
   "files": [
     "dist",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "install.sh",
+    "skills"
   ],
   "keywords": [
     "secrets",

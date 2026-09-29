@@ -27,11 +27,63 @@ No server, no account, no network. One encrypted file on your machine.
 ## Install
 
 ```bash
-npm i -g @mcpmastersh/mcpv     # installs the `mcpv` command
-npx @mcpmastersh/mcpv doctor   # or run it without installing
+curl -fsSL https://raw.githubusercontent.com/mcpmastersh/mcpv/main/install.sh | sh
 ```
 
-Needs Node 20 or newer. No runtime dependencies.
+This downloads one file, puts an `mcpv` command on your PATH and leaves your
+vault alone. Needs Node.js 20+. Prefer npm? Use `npm i -g @mcpmastersh/mcpv`, or
+skip the install with `npx @mcpmastersh/mcpv doctor`. No runtime dependencies.
+
+## Connect your agent
+
+Paste this into Claude Code, Codex, Cursor or any coding agent. It installs
+`mcpv`, moves your `.env` into the vault, and saves a skill so every later
+session knows how to use it:
+
+```text
+Set up mcpv, an offline secrets vault, so you can use my API keys without ever seeing them.
+
+1. Install it (needs Node 20+; no sudo):
+   curl -fsSL https://raw.githubusercontent.com/mcpmastersh/mcpv/main/install.sh | MCPV_SKILL=1 sh
+   Then run `mcpv --version` and `mcpv init`.
+2. Read the skill it saved (~/.claude/skills/mcpv/SKILL.md, or run `mcpv help`) before doing anything else.
+3. If I have a .env, ask me first, then run:
+   mcpv import .env --into mcpm://<workspace>/<project>/<environment> --rewrite
+4. Check and run my app: `mcpv check`, then `mcpv run -- <my dev command>`.
+
+Rules:
+- Never print, log, commit or ask me for a secret value. Refer to secrets by their mcpm:// address.
+- There is no command to reveal a value, on purpose. Do not look for a workaround.
+- To add a key, tell me to run `mcpv set mcpm://<workspace>/<project>/<environment>/<KEY>` and type it at the hidden prompt.
+- Do not guess flags. Run `mcpv help <command>` and use what it lists.
+- If a step fails, quote what it printed and give me the next thing to try.
+```
+
+**Agent skill.** [`skills/mcpv/SKILL.md`](skills/mcpv/SKILL.md) is the standing
+instruction sheet: what an agent can do, what deliberately doesn't exist, and
+how to answer "show me my key". Claude Code loads it on demand from
+`~/.claude/skills/mcpv/`. Save it with `MCPV_SKILL=1` on the installer, or copy
+the file. For any other agent, append it to your project's `AGENTS.md`.
+
+## Upgrade
+
+Run the installer again. It fetches the newest version straight from the npm
+registry, so a stale npm cache can't hold you back, and it tells you what
+changed. Your vault and its key are never touched.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/mcpmastersh/mcpv/main/install.sh | sh
+mcpv --version
+```
+
+Already installed? `mcpv update` does the same thing, and `mcpv update --check`
+only says whether a newer version exists.
+
+Installed with npm? `npm i -g @mcpmastersh/mcpv@latest --prefer-online`.
+(`npm update -g` takes package names only; to pick a version use
+`npm i -g @mcpmastersh/mcpv@0.3.0`.) Still the
+old version afterwards? See [Troubleshooting](#troubleshooting): a second copy
+earlier on your `PATH` is almost always the reason.
 
 ## Five commands you'll use
 
@@ -127,7 +179,7 @@ instead; `mcpv` is the offline one.
 
 ## Using it with Claude Code (or any agent)
 
-Tell the agent how to run things, for example in the project instructions file Claude Code reads at startup:
+The [skill above](#connect-your-agent) covers this. To do it by hand, tell the agent how to run things, for example in the project instructions file Claude Code reads at startup:
 
 ```markdown
 Secrets are in mcpv. `.env` holds mcpm:// references, not values.
@@ -211,7 +263,22 @@ npm cache clean --force
 npm i -g @mcpmastersh/mcpv@0.2.0
 ```
 
-### 2. An older copy answers first
+### 2. `npm i -g` fails with `EEXIST: file already exists`
+
+The one-line installer already put an `mcpv` command at that path (for example
+`~/.local/bin/mcpv`), and npm won't overwrite a file it didn't create. You don't
+need npm: run `mcpv update`. To switch to the npm copy instead, remove the
+installer's file first, then install:
+
+```bash
+rm ~/.local/bin/mcpv
+npm i -g @mcpmastersh/mcpv@latest --prefer-online
+```
+
+`--force` also works but overwrites without asking. Your vault and its key are
+not touched either way.
+
+### 3. An older copy answers first
 
 The new version can be installed and still not be the one that runs. `npm i -g`
 writes into whichever Node is active, and a second global copy can sit earlier on

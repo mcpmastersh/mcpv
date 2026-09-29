@@ -40,6 +40,8 @@ import { open, seal } from "../src/crypto.ts";
 import { parseDotEnv, rewriteAsReferences } from "../src/dotenv.ts";
 import { MASK, Masker } from "../src/mask.ts";
 import { startUi } from "../src/ui-server.ts";
+import { COMMAND_FLAGS } from "../src/cli.ts";
+import { TOPICS } from "../src/help.ts";
 
 const bin = fileURLToPath(new URL("../src/bin.ts", import.meta.url));
 const SECRET = "sk_live_vault-test-9f8e7d6c5b4a";
@@ -1050,4 +1052,44 @@ test("ui: the file picker can select any file, because .env is not a file type",
     ui.close();
     await ui.closed;
   }
+});
+
+// ---------------------------------------------------------------------------
+// mcpv help <command> — every command explains itself, with examples
+// ---------------------------------------------------------------------------
+
+test("help <command> and <command> --help show the same examples, and every example is a real invocation", async () => {
+  const { home } = fresh();
+  const overview = await cli(home, ["help"], { env: { MCPV_PLAIN: "1" } });
+  assert.match(overview.stderr, /mcpv help <command>/, "the overview points at per-command help");
+
+  for (const name of Object.keys(TOPICS)) {
+    const viaHelp = await cli(home, ["help", name], { env: { MCPV_PLAIN: "1" } });
+    const viaFlag = await cli(home, [name, "--help"], { env: { MCPV_PLAIN: "1" } });
+    assert.equal(viaHelp.code, 0, `help ${name}`);
+    assert.equal(viaHelp.stdout, "", "help is for people, so stdout stays empty like the overview");
+    assert.ok(!viaHelp.stderr.includes("\x1b"), "plain output has no escape bytes");
+    assert.equal(viaFlag.stderr, viaHelp.stderr, `${name} --help and help ${name} must agree`);
+    for (const heading of ["Usage", "Examples", "What you should see"]) {
+      assert.match(viaHelp.stderr, new RegExp(heading), `${name}: missing ${heading}`);
+    }
+    // Every example names a command that exists, and no flag the command refuses.
+    for (const [example] of TOPICS[name].examples) {
+      const invoked = example.match(/\bmcpv ([a-z]+)((?: [^|]*)?)$/);
+      assert.ok(invoked, `${name}: can't read example "${example}"`);
+      const probe = await cli(home, [invoked[1], "--help"], { env: { MCPV_PLAIN: "1" } });
+      assert.equal(probe.code, 0, `${name}: "${example}" starts with a command that doesn't exist`);
+      for (const [, flag] of invoked[2].matchAll(/--([a-z-]+)/g)) {
+        // --help short-circuits before flag validation, so ask the flag table itself.
+        const accepted = new Set([...(COMMAND_FLAGS[invoked[1]] ?? []), "help", "plain", "json"]);
+        assert.ok(accepted.has(flag), `${name}: "${example}" uses --${flag}, which ${invoked[1]} refuses`);
+      }
+    }
+  }
+
+  const alias = await cli(home, ["help", "ls"], { env: { MCPV_PLAIN: "1" } });
+  assert.match(alias.stderr, /mcpv list/);
+  const unknown = await cli(home, ["help", "reveal"], { env: { MCPV_PLAIN: "1" } });
+  assert.equal(unknown.code, 2, "an unknown topic is a wrong invocation");
+  assert.match(unknown.stderr, /no command called “reveal”/);
 });
