@@ -699,6 +699,11 @@ function projectCard(check) {
       })));
 }
 
+/** A whole environment as the .env text that references it: one KEY=address line per key. */
+function envFile(env) {
+  return env.keys.map((key) => `${key.name}=${env.address}/${key.name}`).join("\n") + "\n";
+}
+
 function splitAddress(address) {
   const i = address.lastIndexOf("/");
   return [address.slice(0, i), address.slice(i + 1)];
@@ -728,7 +733,15 @@ function environmentStrip(environments) {
           title: `Filter the list to ${env.address}`,
           onclick: () => setFilters({ ...draft, page: 1 }),
         }, h("span", {}, env.address.replace(/^mcpm:\/\//, "")), h("span", { class: "count" }, String(env.keys.length))),
-        h("button", { type: "button", class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Copy ${env.address}`, title: "Copy the environment address", onclick: () => copy(env.address, "Copied the environment address") }, icon("copy")),
+        // Labelled, not icon-only: a tooltip is invisible to anyone who isn't
+        // hovering, and this is the button a whole project's setup starts from.
+        h("button", { type: "button", class: "btn btn-sm btn-ghost chip-copy", "aria-label": `Copy the address ${env.address}`, onclick: () => copy(env.address, "Copied the environment address") }, icon("copy"), "Address"),
+        h("button", {
+          type: "button",
+          class: "btn btn-sm chip-copy chip-copy-env",
+          "aria-label": `Copy a .env file with all ${env.keys.length} keys in ${env.address}`,
+          onclick: () => copy(envFile(env), `Copied ${plural(env.keys.length, "line")} for a .env file`),
+        }, icon("file"), "Copy .env"),
         h("button", { type: "button", class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Add a secret to ${env.address}`, title: "Add a secret here", onclick: () => secretDialog({ draft }) }, icon("plus")));
     })));
 }
@@ -791,7 +804,8 @@ function secretRow(row) {
     h("span", { class: "when" }, row.updatedAt ? `Updated ${ago(row.updatedAt)}` : ""),
     h("span", { class: "masked", "aria-label": "Value hidden" }, "••••••••"),
     h("div", { class: "row-actions" },
-      h("button", { class: "btn btn-sm btn-ghost", title: "Copy a .env line that references it", onclick: () => copy(`${row.key}=${row.address}`, `Copied ${row.key}=… reference`) }, icon("copy"), "Reference"),
+      h("button", { class: "btn btn-sm btn-ghost", "aria-label": `Copy the address of ${row.key}`, onclick: () => copy(row.address, `Copied the address of ${row.key}`) }, icon("copy"), "Address"),
+      h("button", { class: "btn btn-sm btn-ghost", "aria-label": `Copy the .env line for ${row.key}`, onclick: () => copy(`${row.key}=${row.address}`, `Copied ${row.key}=… line`) }, icon("copy"), ".env line"),
       h("button", { class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Replace ${row.key}`, title: "Replace value", onclick: () => secretDialog({ draft: draftFrom(`mcpm://${row.path}`), key: row.key, replacing: true }) }, icon("edit")),
       h("button", { class: "btn btn-sm btn-ghost icon-btn", "aria-label": `Delete ${row.key}`, title: "Delete", onclick: () => removeSecret(row.address, row.key) }, icon("trash"))));
 }
@@ -805,6 +819,81 @@ function facetsFrom(environments) {
   return { rows, workspaces: [...new Set(rows.map((row) => row.workspace))].sort() };
 }
 
+// ---------------------------------------------------------------------------
+// First-run guide
+//
+// A person who opens an empty vault has no idea what a secret "address" is for
+// or what should happen next, and a tool that needs an explanation before it
+// does anything is one people quit. So the empty state is a numbered path with
+// a sample to try, and each step says what they should SEE when it worked.
+// ---------------------------------------------------------------------------
+
+const SAMPLE = { draft: { workspace: "demo", project: "hello", environment: "dev" }, key: "GREETING" };
+const SAMPLE_LINE = "GREETING=mcpm://demo/hello/dev/GREETING";
+const SAMPLE_RUN = `mcpv run -- node -e "console.log('GREETING is', process.env.GREETING)"`;
+const AGENT_LINE = "Secrets are in mcpv. .env holds mcpm:// references, not values. Start anything that needs them with `mcpv run -- <command>`. Never ask me for a secret value; `mcpv check` shows what's missing.";
+
+/** A command you copy, with the button labelled: a bare icon gets missed. */
+function commandBlock(text) {
+  return h("div", { class: "cmd" },
+    h("code", {}, text),
+    h("button", { type: "button", class: "btn btn-sm cmd-copy", "aria-label": `Copy: ${text}`, onclick: () => copy(text, "Copied") }, icon("copy"), "Copy"));
+}
+
+function guideStep(n, title, ...children) {
+  return h("li", { class: "guide-step" },
+    h("span", { class: "guide-n", "aria-hidden": "true" }, String(n)),
+    h("div", { class: "guide-body" }, h("b", {}, title), ...children));
+}
+
+function expect(text) {
+  return h("p", { class: "expect" }, h("span", {}, "You should see"), text);
+}
+
+const CHEAT_SHEET = [
+  ["mcpv help", "Every command, with examples"],
+  ["mcpv help set", "Examples for one command (try it on any of them)"],
+  ["mcpv ui", "This page"],
+  ["mcpv set <address>", "Add or replace one secret (hidden prompt)"],
+  ["mcpv import .env --into mcpm://ws/proj/dev --rewrite", "Move a .env into the vault"],
+  ["mcpv check", "Does every reference in ./.env resolve? Names only"],
+  ["mcpv run -- <command>", "Run with your secrets; output is masked"],
+  ["mcpv list", "Environments and key names, never values"],
+  ["mcpv doctor", "Where the vault lives and whether it unlocks"],
+];
+
+function cheatSheet() {
+  return h("dl", { class: "cheats" }, CHEAT_SHEET.flatMap(([cmd, what]) => [
+    h("dt", {}, h("button", { type: "button", class: "cheat-cmd mono", "aria-label": `Copy: ${cmd}`, onclick: () => copy(cmd, "Copied") }, cmd)),
+    h("dd", {}, what),
+  ]));
+}
+
+function guideCard() {
+  return h("section", { class: "card guide" },
+    h("div", { class: "card-head" }, h("h2", {}, "Get started in four steps")),
+    h("p", { class: "sub" }, "mcpv keeps your secrets encrypted on this machine. Your ", h("code", {}, ".env"), " holds addresses instead of values, and ", h("code", {}, "mcpv run"), " fills the real values in for one command. An AI agent can run your app this way without ever seeing a key."),
+    h("ol", { class: "guide-steps" },
+      guideStep(1, "Store a sample secret",
+        h("p", {}, "A throwaway, so you can see how it works before using a real key. Type any value you like (4+ characters, like hello-world)."),
+        h("div", { class: "actions" }, h("button", { class: "btn btn-primary", onclick: () => secretDialog(SAMPLE) }, icon("plus"), "Add the sample")),
+        expect("GREETING in the list below, with •••••••• where its value would be. Values are never shown, here or anywhere.")),
+      guideStep(2, "Point your .env at it",
+        h("p", {}, "In your project folder, add this line to ", h("code", {}, ".env"), ". It's an address, not a value, so it is safe to commit or paste to an agent."),
+        commandBlock(SAMPLE_LINE),
+        expect("Nothing secret in the file. Later, Import .env moves your real values in and rewrites the file this way for you.")),
+      guideStep(3, "Run something with it",
+        h("p", {}, "In a terminal opened in that same folder:"),
+        commandBlock(SAMPLE_RUN),
+        expect("GREETING is [redacted]. The program received the real value, but mcpv masks it on the way out, which is what keeps it out of logs and agent transcripts.")),
+      guideStep(4, "Tell your agent",
+        h("p", {}, "Paste this into Claude Code, Codex or Cursor (or your project's instructions file):"),
+        commandBlock(AGENT_LINE),
+        expect("The agent runs your app through mcpv run, and asks you to add a key yourself when one is missing.")),
+    ),
+    h("details", { class: "cheat" }, h("summary", {}, "Command cheat sheet"), cheatSheet()));
+}
+
 function render() {
   const app = document.getElementById("app");
   const { state, check, page } = data;
@@ -815,9 +904,10 @@ function render() {
 
   const body = [];
   if (total === 0) {
+    body.push(guideCard());
     body.push(h("section", { class: "card empty" },
-      h("b", {}, "No secrets yet"),
-      h("p", {}, "Add one, or import an existing .env. Then point your .env at mcpm:// addresses and start your app with mcpv run."),
+      h("b", {}, "Already have keys?"),
+      h("p", {}, "Skip the sample: import an existing .env, or add a real secret."),
       h("div", { class: "actions" },
         h("button", { class: "btn", onclick: importDialog }, icon("upload"), "Import .env"),
         h("button", { class: "btn btn-primary", onclick: () => secretDialog() }, icon("plus"), "Add secret"))));
@@ -831,6 +921,7 @@ function render() {
           h("p", {}, "Try a shorter search, or clear the filters."),
           h("div", { class: "actions" }, h("button", { class: "btn", onclick: () => setFilters({ search: "", workspace: "", project: "", environment: "" }) }, "Clear filters")))
         : h("ul", { class: "rows" }, page.items.map(secretRow))));
+    body.push(h("details", { class: "card cheat cheat-card" }, h("summary", {}, "Command cheat sheet"), cheatSheet()));
   }
 
   // The search box is re-created by this render, so whichever control the

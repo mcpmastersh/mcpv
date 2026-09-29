@@ -42,6 +42,7 @@ import {
   type SecretRow,
 } from "./address-input.ts";
 import { DotEnvError, isReferenceValue, parseDotEnv, references, resolveDotEnv, rewriteAsReferences } from "./dotenv.ts";
+import { isTopic, showTopic } from "./help.ts";
 import { KeyError, availableOsStore, envKey, type KeyStore } from "./keys.ts";
 import { MIN_MASK_LENGTH } from "./mask.ts";
 import { CommandNotFoundError, runWithEnv } from "./run.ts";
@@ -834,6 +835,10 @@ function help(): void {
   cmd("init [--key-store s]", "Create the vault (keychain, secret-service or file)");
   cmd("ui [--port n] [--no-open]", "Open a local web UI: browse, add, replace, import. Never shows a value");
   cmd("doctor", "Where the vault and its key live, and whether it unlocks");
+  cmd("update [--check]", "Install the newest version (bypasses the npm cache)");
+  say();
+  say(`  ${bold("Stuck on a command?")}  ${accent("mcpv help <command>")}  ${muted("shows what it does, examples to copy and what you should see:")}`);
+  say(`                        ${muted("mcpv help set    mcpv help import    mcpv help run")}`);
   say();
   say(`  ${bold("Addresses")}   ${muted("mcpm://<workspace>/<project>/<environment>[/<KEY>]")}`);
   say(`              ${muted("acme/api/dev/STRIPE_KEY and Acme/API/Dev/STRIPE_KEY work too — case,")}`);
@@ -846,6 +851,43 @@ function help(): void {
   say(`              ${muted("--limit n (environments per page, default " + LIST_PAGE_SIZE + ")  --page n")}`);
   say(`  ${bold("Flags")}       ${muted("--json (list, check, doctor)  --no-mask --quiet (run)  --only --rewrite (import)  --yes (rm)")}`);
   say(`  ${bold("Env")}         ${muted("MCPV_HOME  MCPV_KEY  MCPV_PLAIN  MCPV_ASCII  NO_COLOR")}`);
+}
+
+const INSTALLER_URL = "https://raw.githubusercontent.com/mcpmastersh/mcpv/main/install.sh";
+
+async function cmdUpdate(p: Parsed): Promise<void> {
+  let latest = "";
+  try {
+    const res = await fetch("https://registry.npmjs.org/@mcpmastersh/mcpv/latest", {
+      headers: { "cache-control": "no-cache" },
+      signal: AbortSignal.timeout(8000),
+    });
+    latest = ((await res.json()) as { version?: string }).version ?? "";
+  } catch {
+    // Offline or blocked: the installer reports its own error.
+  }
+  if (has(p, "check")) {
+    if (!latest) throw new CliError("Couldn't reach the npm registry", ["mcpv update"]);
+    if (latest === VERSION) say(row("ok", `Up to date  v${VERSION}`));
+    else {
+      say(row("info", `v${latest} is available`, `you have v${VERSION}`));
+      say(action("mcpv update"));
+    }
+    return;
+  }
+  if (latest && latest === VERSION) {
+    say(row("ok", `Already the newest version  v${VERSION}`));
+    return;
+  }
+  say(row("info", latest ? `Updating v${VERSION} -> v${latest}` : "Updating to the newest version"));
+  // The installer reads the registry directly, so a stale npm cache can't hold it back.
+  // Your vault and its key are not touched.
+  const code: number = await new Promise((resolve) => {
+    const child = spawn("sh", ["-c", `curl -fsSL ${INSTALLER_URL} | sh`], { stdio: "inherit" });
+    child.on("error", () => resolve(1));
+    child.on("close", (c) => resolve(c ?? 1));
+  });
+  if (code !== 0) throw new CliError("The update didn't finish", [`curl -fsSL ${INSTALLER_URL} | sh`]);
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +905,8 @@ const COMMANDS: Record<string, (p: Parsed) => void | Promise<void>> = {
   rm: cmdRemove,
   doctor: cmdDoctor,
   ui: cmdUi,
+  update: cmdUpdate,
+  upgrade: cmdUpdate,
 };
 
 /**
@@ -878,7 +922,7 @@ const COMMANDS: Record<string, (p: Parsed) => void | Promise<void>> = {
  * message (the one naming `--env`) is what gets printed instead of this table's
  * generic line.
  */
-const COMMAND_FLAGS: Record<string, string[]> = {
+export const COMMAND_FLAGS: Record<string, string[]> = {
   init: ["key-store"],
   set: [],
   import: ["into", "only", "rewrite"],
@@ -888,6 +932,8 @@ const COMMAND_FLAGS: Record<string, string[]> = {
   run: ["env", "env-file", "no-mask", "quiet", "workspace", "project", "environment"],
   rm: ["yes"],
   doctor: [],
+  update: ["check"],
+  upgrade: ["check"],
   ui: ["port", "no-open"],
 };
 
@@ -917,11 +963,17 @@ export async function main(argv: string[]): Promise<void> {
     const [name, ...rest] = argv;
     const p = parseArgs(rest);
     if (has(p, "plain") || has(p, "json")) setPlain();
-    if (!name || name === "help" || name === "--help" || name === "-h") return help();
+    if (name === "help") {
+      // `mcpv help set` — one command, in detail.
+      if (p.positionals[0]) return showTopic(p.positionals[0]);
+      return help();
+    }
+    if (!name || name === "--help" || name === "-h") return help();
     if (name === "version" || name === "--version" || name === "-v") return out(VERSION);
     const command = COMMANDS[name];
     if (!command) throw new CliError(`Unknown command: ${name}`, ["mcpv help"], 2);
-    if (has(p, "help")) return help();
+    // `mcpv set --help` is the same question as `mcpv help set`.
+    if (has(p, "help")) return isTopic(name) ? showTopic(name) : help();
     rejectUnknownFlags(name, p);
     await command(p);
   } catch (error) {

@@ -147,6 +147,10 @@ main { max-width: 960px; margin: 0 auto; padding: 28px 16px 64px; }
 .env-chip-main:hover { color: var(--accent); }
 .env-chip .count { color: var(--muted); font-size: 11.5px; border-left: 1px solid var(--border); padding-left: 8px; }
 .env-chip .btn { border-radius: 0; }
+.chip-copy { display: inline-flex; align-items: center; gap: 5px; }
+.chip-copy svg { width: 14px; height: 14px; }
+.env-chip .chip-copy-env { border: 0; border-left: 1px solid var(--accent); background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.env-chip .chip-copy-env:hover { background: var(--accent); color: var(--background); }
 
 /* ---------- Toolbar: search, filters, paging ---------- */
 
@@ -273,3 +277,24 @@ input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: 
   .toolbar-row .search-wrap { min-width: 100%; }
   select.select { max-width: 100%; flex: 1; }
 }
+
+/* First-run guide */
+.guide-steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 18px; }
+.guide-step { display: grid; grid-template-columns: 28px 1fr; gap: 12px; align-items: start; }
+.guide-n { width: 28px; height: 28px; border-radius: 50%; background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 13px; display: grid; place-items: center; }
+.guide-body p { margin: 6px 0; color: var(--muted); font-size: 13.5px; }
+.guide-body .actions { display: flex; gap: 8px; margin: 8px 0; }
+.expect { border-left: 2px solid var(--border); padding-left: 10px; }
+.expect span { display: block; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent); font-weight: 600; }
+.cmd { display: flex; align-items: center; gap: 8px; margin: 8px 0; background: var(--surface-raised); border: 1px solid var(--border); border-radius: 8px; padding: 6px 6px 6px 12px; }
+.cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--foreground); }
+.cmd-copy { flex: none; display: inline-flex; align-items: center; gap: 5px; }
+.cmd-copy svg { width: 14px; height: 14px; }
+.cheat { margin-top: 18px; border-top: 1px solid var(--border); padding-top: 12px; }
+.cheat-card { padding: 14px 20px; margin-top: 16px; }
+.cheat summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+.cheats { display: grid; grid-template-columns: minmax(0, max-content) 1fr; gap: 6px 16px; margin: 12px 0 0; align-items: center; }
+.cheats dd { margin: 0; color: var(--muted); font-size: 13.5px; }
+.cheat-cmd { border: 0; background: var(--surface-raised); color: inherit; border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; cursor: pointer; text-align: left; }
+.cheat-cmd:hover { border-color: var(--accent); }
+@media (max-width: 640px) { .cheats { grid-template-columns: 1fr; } .cheats dd { margin-bottom: 6px; } }
