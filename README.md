@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/mcpv-logo-dark.svg">
-    <img src="docs/mcpv-logo.svg" width="56" height="56" alt="mcpv">
+    <source media="(prefers-color-scheme: dark)" srcset="brand/mcpv-logo-dark.svg">
+    <img src="brand/mcpv-logo-light.svg" width="56" height="56" alt="mcpv">
   </picture>
 </p>
 
@@ -75,6 +75,7 @@ Windsurf · OpenCode · VS Code · CI
 - [Pairs with mcpmaster](#pairs-with-mcpmaster)
 - [mcpmaster Cloud](#mcpmaster-cloud)
 - [FAQ](#faq)
+- [Brand](#brand)
 
 ## Install
 
@@ -525,6 +526,10 @@ addresses.
 </details>
 
 Anything else? [Open an issue](https://github.com/mcpmastersh/mcpv/issues).
+
+## Brand
+
+Logo files, PNG exports and usage notes are in [`brand/`](brand/).
 
 ## License
 
