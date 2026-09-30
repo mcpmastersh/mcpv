@@ -6,6 +6,13 @@ project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-09-30
+
+### Fixed
+
+- README images (logo, data-path diagram) now load on npm; they used
+  relative paths npm could not resolve.
+
 ## [0.3.4] - 2026-09-30
 
 ### Changed

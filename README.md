@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="brand/mcpv-logo-dark.svg">
-    <img src="brand/mcpv-logo-light.svg" width="56" height="56" alt="mcpv">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mcpmastersh/mcpv/main/brand/mcpv-logo-dark.svg">
+    <img src="https://raw.githubusercontent.com/mcpmastersh/mcpv/main/brand/mcpv-logo-light.svg" width="56" height="56" alt="mcpv">
   </picture>
 </p>
 
@@ -20,8 +20,8 @@
 </p>
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/mcpv-data-path-dark.svg">
-  <img alt="How mcpv moves a secret: .env holds mcpm:// addresses → the AES-256-GCM vault decrypts in memory → one child process gets the values → a mask turns every secret in stdout and stderr into [redacted] → the agent only ever sees [redacted]." src="docs/mcpv-data-path-light.svg" width="100%">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/mcpmastersh/mcpv/main/docs/mcpv-data-path-dark.svg">
+  <img alt="How mcpv moves a secret: .env holds mcpm:// addresses → the AES-256-GCM vault decrypts in memory → one child process gets the values → a mask turns every secret in stdout and stderr into [redacted] → the agent only ever sees [redacted]." src="https://raw.githubusercontent.com/mcpmastersh/mcpv/main/docs/mcpv-data-path-light.svg" width="100%">
 </picture>
 
 ---
@@ -529,7 +529,7 @@ Anything else? [Open an issue](https://github.com/mcpmastersh/mcpv/issues).
 
 ## Brand
 
-Logo files, PNG exports and usage notes are in [`brand/`](brand/).
+Logo files, PNG exports and usage notes are in [`brand/`](https://github.com/mcpmastersh/mcpv/tree/main/brand).
 
 ## License
 
