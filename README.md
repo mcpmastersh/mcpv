@@ -16,6 +16,11 @@
   <a href="https://mcpmaster.sh/"><img alt="Cloud: mcpmaster.sh" src="https://img.shields.io/badge/cloud-mcpmaster.sh-121216"></a>
 </p>
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/mcpv-data-path-dark.svg">
+  <img alt="How mcpv moves a secret: .env holds mcpm:// addresses → the AES-256-GCM vault decrypts in memory → one child process gets the values → a mask turns every secret in stdout and stderr into [redacted] → the agent only ever sees [redacted]." src="docs/mcpv-data-path-light.svg" width="100%">
+</picture>
+
 ---
 
 Your `.env` holds addresses, not values. `mcpv run` hands the real values to one
@@ -56,7 +61,6 @@ Windsurf · OpenCode · VS Code · CI
 
 - [Install](#install)
 - [Set it up with your agent](#set-it-up-with-your-agent)
-- [Data path: one secret, start to finish](#data-path-one-secret-start-to-finish)
 - [How it works: five commands](#how-it-works-five-commands)
 - [Addresses](#addresses)
 - [Web UI](#web-ui)
@@ -141,16 +145,6 @@ MCPV_KEY=<64 hex chars> mcpv run -- npm test
 Setting a secret needs you: values are only accepted from a hidden prompt or
 from stdin, never as command arguments, which end up in shell history, in `ps`
 and in agent transcripts.
-
-## Data path: one secret, start to finish
-
-Your agent reads addresses on the way in and redactions on the way out. The
-real value only exists inside one process, in memory.
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/mcpv-data-path-dark.svg">
-  <img alt="How mcpv moves a secret: .env holds mcpm:// addresses → the AES-256-GCM vault decrypts in memory → one child process gets the values → a mask turns every secret in stdout and stderr into [redacted] → the agent only ever sees [redacted]." src="docs/mcpv-data-path-light.svg" width="100%">
-</picture>
 
 ## How it works: five commands
 
