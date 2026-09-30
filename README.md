@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="docs/mcpv-logo.svg" width="56" height="56" alt="mcpv">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/mcpv-logo-dark.svg">
+    <img src="docs/mcpv-logo.svg" width="56" height="56" alt="mcpv">
+  </picture>
 </p>
 
 <h1 align="center">mcpv</h1>

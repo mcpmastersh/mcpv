@@ -6,6 +6,12 @@ project uses [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- New logo: `[v]`, the brackets from `[redacted]` around a v. It replaces
+  the old mark in the web UI (favicon and sidebar) and in the README.
+  The tile is light in light mode and dark in dark mode.
+
 ## [0.3.3] - 2026-09-29
 
 ### Changed
